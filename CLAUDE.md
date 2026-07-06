@@ -76,12 +76,27 @@ x:xmptk="iRate 1.0".
   interface is hand-declared — mingw headers lack it; GUID 3B16811B-6A43-4ec9-B713-
   3D5A0C13B940, vtable: CopyPixels, GetClosestSize, GetClosestPixelFormat,
   DoesSupportTransform; falls back to scaler if QI fails).
-- Two queues: high (fullscreen images, 100% zoom, VISIBLE grid thumbs) drained
-  before low (background thumbnail read-ahead/preload). Only worker 0 may take
-  low-priority jobs — the other workers serve the high queue exclusively, so a
-  fresh arrow-press decode never queues behind background thumbnails and slow
-  (USB/spinning) drives never see a multi-reader seek storm. Generation counter
-  invalidates in-flight decodes across sort changes.
+- WIC TRAP (cost a week of "slow drive" red herrings): IWICBitmapFlipRotator
+  pulls source COLUMNS per output line, re-running the whole upstream
+  decode/scale chain each time — O(n²). MEASURED: 9.5s vs 16ms for one portrait
+  (orient=8) a7R3 1616×1080 preview. ALWAYS CreateBitmapFromSource(...,
+  WICBitmapCacheOnLoad) to materialize pixels immediately before the rotator.
+  Symptom was folder-dependent (portrait-heavy shoots), not drive-dependent.
+- g_inFlight (under g_queueMx) stops workers duplicating a decode that another
+  worker already has in progress; non-front requests skip in-flight items, but
+  front (on-screen) requests are deliberately NOT deduped — a stale-generation
+  in-flight decode is discarded on completion, and a deduped front request
+  would then leave the current image undecoded ("loading…" until next nav).
+- Two queues: high (fullscreen images + 100% zoom) drained before low
+  (thumbnails). Scheduling adapts to the drive via driveIsSlow() (seek-penalty
+  IOCTL; on failure USB bus → slow; network → slow — policy VERIFIED against
+  the owner's 11-drive fleet: some USB HDD enclosures fail the seek query, all
+  drives report DRIVE_FIXED). Fast drives: all workers take both queues,
+  visible grid thumbs push_front on low — the original behaviour, do not
+  single-thread SSDs (caused a real regression once). Slow drives: ONLY worker
+  0 may take low jobs (one sequential reader, no seek storm) and visible grid
+  thumbs ride the high queue so they still decode in parallel. Generation
+  counter invalidates in-flight decodes across sort changes.
 - ALL sidecar I/O is async on a dedicated sidecarThread (reads + FIFO writes,
   writes drain first and are flushed on exit). The UI thread NEVER touches the
   photo drive: paint/setCurrent request loads, rating keys queue saves. A field

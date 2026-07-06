@@ -8,11 +8,13 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winioctl.h>
 #include <initguid.h>
 #include <wincodec.h>
 #include <shobjidl.h>
 #include <shlwapi.h>
 #include <shellapi.h>
+#include <cstdarg>
 #include <string>
 #include <vector>
 #include <map>
@@ -96,6 +98,7 @@ static std::vector<std::wstring> g_exts = { L".arw" };
 static std::map<UINT, Action> g_keymap;
 static std::wstring g_iniPath;
 static bool g_sessionInFolder = true;
+static bool g_slowDrive = false;           // browsed folder is on a seek-bound drive
 static bool g_pairRawJpg = true;           // collapse RAW+JPG pairs to one entry      // per-folder resume file in the dataset root
 static int g_sortType = 0;                 // 0=name 1=date 2=size
 static bool g_sortDesc = false;
@@ -145,6 +148,7 @@ static std::mutex g_cacheMx;
 static std::deque<int> g_queue;      // high priority: view + zoom decodes
 static std::deque<int> g_lowQueue;   // low priority: thumbnails
 static std::set<int> g_lowSet;       // dedupe for bulk preload
+static std::set<int> g_inFlight;     // keys being decoded right now (guarded by g_queueMx)
 static std::mutex g_queueMx;
 static std::condition_variable g_queueCv;
 static std::atomic<bool> g_quit{false};
@@ -165,6 +169,31 @@ static std::wstring utf8ToWide(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
     return w;
 }
+// ---- debug log: ini [options] debuglog=1 -> %LOCALAPPDATA%\iRate\irate.log.
+// No-op (one branch) when disabled; never enabled by default.
+static HANDLE g_logFile = INVALID_HANDLE_VALUE;
+static std::mutex g_logMx;
+static ULONGLONG g_logT0 = 0;
+static void logLine(const char* fmt, ...) {
+    if (g_logFile == INVALID_HANDLE_VALUE) return;
+    char buf[600];
+    ULONGLONG t = GetTickCount64() - g_logT0;
+    int n = snprintf(buf, 40, "%6llu.%03llu [%5lu] ",
+                     t / 1000, t % 1000, GetCurrentThreadId());
+    va_list ap; va_start(ap, fmt);
+    int m = vsnprintf(buf + n, sizeof(buf) - n - 2, fmt, ap);
+    va_end(ap);
+    if (m > 0) n += m;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    std::lock_guard<std::mutex> lk(g_logMx);
+    DWORD wr;
+    WriteFile(g_logFile, buf, (DWORD)n, &wr, nullptr);
+}
+static const wchar_t* pathTail(const std::wstring& p) {
+    size_t s = p.find_last_of(L"\\/");
+    return p.c_str() + (s == std::wstring::npos ? 0 : s + 1);
+}
+
 static bool readWholeFile(const std::wstring& path, std::string& out) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING, 0, nullptr);
@@ -245,11 +274,13 @@ static void sidecarThread() {
             }
         }
         if (haveWr) {
+            ULONGLONG t0 = GetTickCount64();
             std::wstring sp = sidecarPath(wr.path);
             std::string content;
             readWholeFile(sp, content);
             std::string out = xmpApply(content, wr.rating, wr.label);
             writeWholeFileAtomic(sp, out);
+            logLine("xmp write %llums  %ls", (unsigned long long)(GetTickCount64() - t0), pathTail(sp));
             if (wr.rating == kXmpKeep || wr.label == kXmpKeep) {
                 // rated before the sidecar loaded: adopt what the patched
                 // sidecar actually says for the still-unknown field
@@ -271,6 +302,7 @@ static void sidecarThread() {
             if (rdIdx < 0 || rdIdx >= (int)g_items.size() || g_items[rdIdx].rating != -2) continue;
             path = g_items[rdIdx].path;
         }
+        ULONGLONG t0 = GetTickCount64();
         std::string content; int r = 0, l = 0;
         if (readWholeFile(sidecarPath(path), content)) xmpParse(content, r, l);
         {
@@ -279,6 +311,8 @@ static void sidecarThread() {
                 g_items[rdIdx].rating = r; g_items[rdIdx].label = l;
             }
         }
+        ULONGLONG ms = GetTickCount64() - t0;
+        if (ms > 50) logLine("SLOW xmp read item=%d %llums", rdIdx, (unsigned long long)ms);
         PostMessageW(g_hwnd, WM_APP_SIDECAR1, (WPARAM)rdIdx, 0);
     }
 }
@@ -446,6 +480,8 @@ L"; file extensions to include (semicolon separated). JPEGs also supported.\r\n"
 L"extensions=.arw;.cr2;.cr3;.nef;.nrw;.raf;.rw2;.pef;.dng;.orf\r\n"
 L"; show the info bar at startup\r\n"
 L"showinfo=1\r\n"
+L"; debuglog=1 writes timing diagnostics to irate.log next to this ini\r\n"
+L"debuglog=0\r\n"
 L"[state]\r\n"
 L"lastfolder=\r\n";
 
@@ -545,6 +581,12 @@ static void loadConfig() {
             WritePrivateProfileStringW(L"keys", L"prefs", L"SHIFT+P", g_iniPath.c_str());
     }
     WritePrivateProfileStringW(L"state", L"version", L"4", g_iniPath.c_str());
+    if (iniGet(L"options", L"debuglog", L"0") == L"1") {
+        std::wstring lp = g_iniPath.substr(0, g_iniPath.find_last_of(L"\\/") + 1) + L"irate.log";
+        g_logFile = CreateFileW(lp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        g_logT0 = GetTickCount64();
+    }
     g_exts.clear();
     size_t start = 0;
     while (start <= ex.size()) {
@@ -561,6 +603,40 @@ static void loadConfig() {
         start = semi + 1;
     }
     if (g_exts.empty()) g_exts.push_back(L".arw");
+}
+
+// is the folder on a seek-bound drive? Policy verified against a real 11-drive
+// fleet: the seek-penalty query answers correctly on NVMe/SATA/most USB (incl.
+// USB SSDs); some USB HDD enclosures fail it (ERROR_INVALID_FUNCTION), so a
+// failed query on a USB bus means "assume spinning". Network is always slow.
+static bool driveIsSlow(const std::wstring& folder) {
+    if (folder.size() < 2 || folder[1] != L':') return true;      // UNC path
+    wchar_t root[4] = { folder[0], L':', L'\\', 0 };
+    if (GetDriveTypeW(root) == DRIVE_REMOTE) return true;
+    wchar_t vol[8] = { L'\\', L'\\', L'.', L'\\', folder[0], L':', 0 };
+    HANDLE h = CreateFileW(vol, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;                  // can't tell: assume fast
+    bool slow = false;
+    STORAGE_PROPERTY_QUERY q{};
+    q.PropertyId = StorageDeviceSeekPenaltyProperty;
+    q.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR d{};
+    DWORD br = 0;
+    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), &d, sizeof(d), &br, nullptr) &&
+        br >= sizeof(d)) {
+        slow = d.IncursSeekPenalty != FALSE;
+    } else {
+        STORAGE_PROPERTY_QUERY q2{};
+        q2.PropertyId = StorageDeviceProperty;
+        q2.QueryType = PropertyStandardQuery;
+        BYTE buf[1024] = {};
+        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q2, sizeof(q2), buf, sizeof(buf), &br, nullptr) &&
+            br >= sizeof(STORAGE_DEVICE_DESCRIPTOR))
+            slow = ((STORAGE_DEVICE_DESCRIPTOR*)buf)->BusType == BusTypeUsb;
+    }
+    CloseHandle(h);
+    return slow;
 }
 
 // ------------------------------------------------------------------ scanning
@@ -652,6 +728,7 @@ static void scanThread() {
         g_items = std::move(files);
     }
     g_scanning = false;
+    logLine("scan done  items=%d", (int)g_items.size());
     PostMessageW(g_hwnd, WM_APP_SCANDONE, 0, 0);
 }
 
@@ -788,7 +865,12 @@ static void tcInit() {
     }
 }
 static bool tcLookup(uint64_t hash, uint64_t mtime, uint64_t fsize, std::vector<uint8_t>& blob, int& w, int& h) {
+    ULONGLONG t0 = GetTickCount64();
     std::lock_guard<std::mutex> lk(g_tcMx);
+    if (g_logFile != INVALID_HANDLE_VALUE) {
+        ULONGLONG w8 = GetTickCount64() - t0;
+        if (w8 > 50) logLine("SLOW tc lock wait %llums", (unsigned long long)w8);
+    }
     if (g_tcFile == INVALID_HANDLE_VALUE) return false;
     auto it = g_tcIndex.find(hash);
     if (it == g_tcIndex.end() || it->second.mtime != mtime || it->second.fsize != fsize) return false;
@@ -802,6 +884,7 @@ static bool tcLookup(uint64_t hash, uint64_t mtime, uint64_t fsize, std::vector<
 }
 static void tcAppend(uint64_t hash, uint64_t mtime, uint64_t fsize, uint16_t w, uint16_t h,
                      const void* data, uint32_t len) {
+    ULONGLONG t0app = GetTickCount64();
     std::lock_guard<std::mutex> lk(g_tcMx);
     if (g_tcFile == INVALID_HANDLE_VALUE || !len) return;
     LARGE_INTEGER sz; GetFileSizeEx(g_tcFile, &sz);
@@ -819,6 +902,8 @@ static void tcAppend(uint64_t hash, uint64_t mtime, uint64_t fsize, uint16_t w, 
     ov2.OffsetHigh = (DWORD)(off2 >> 32);
     if (!WriteFile(g_tcFile, data, len, &wr, &ov2) || wr != len) return;
     g_tcIndex[hash] = { off2, len, mtime, fsize, w, h };
+    ULONGLONG ms = GetTickCount64() - t0app;
+    if (ms > 100) logLine("SLOW tcAppend %llums len=%u", (unsigned long long)ms, len);
 }
 static uint64_t tcSizeBytes() {
     std::lock_guard<std::mutex> lk(g_tcMx);
@@ -977,6 +1062,7 @@ private:
 };
 
 static void decodeOne(IWICImagingFactory* fac, int idx, int mode) {
+    ULONGLONG t0 = GetTickCount64(), tRead = 0;
     int gen = g_generation.load();
     std::wstring path;
     uint64_t mtimeV = 0, fsizeV = 0;
@@ -1023,6 +1109,7 @@ static void decodeOne(IWICImagingFactory* fac, int idx, int mode) {
         }
         CloseHandle(hf);
     }
+    tRead = GetTickCount64();
 
     if (!slot.failed) {
         slot.exif = res.exif;
@@ -1091,7 +1178,14 @@ static void decodeOne(IWICImagingFactory* fac, int idx, int mode) {
             }
 
             IWICBitmapFlipRotator* rot = nullptr;
+            IWICBitmap* rotCache = nullptr;
             if (SUCCEEDED(hr) && (orient == 3 || orient == 6 || orient == 8)) {
+                // materialize the scaled pixels BEFORE rotating: the rotator
+                // pulls source columns per output line, re-running the whole
+                // upstream decode/scale chain each time — measured 9.5s vs
+                // 16ms on one portrait a7R3 preview (classic WIC O(n^2) trap)
+                if (SUCCEEDED(fac->CreateBitmapFromSource(afterScale, WICBitmapCacheOnLoad, &rotCache)))
+                    afterScale = rotCache;
                 if (SUCCEEDED(fac->CreateBitmapFlipRotator(&rot))) {
                     WICBitmapTransformOptions o =
                         orient == 3 ? WICBitmapTransformRotate180 :
@@ -1130,6 +1224,7 @@ static void decodeOne(IWICImagingFactory* fac, int idx, int mode) {
             }
             if (conv) conv->Release();
             if (rot) rot->Release();
+            if (rotCache) rotCache->Release();
             if (scaler) scaler->Release();
             cur->Release();
         }
@@ -1141,6 +1236,10 @@ static void decodeOne(IWICImagingFactory* fac, int idx, int mode) {
 
     }   // !cached
 
+    logLine("decoded item=%d mode=%d cached=%d fail=%d read=%llums total=%llums  %ls",
+            idx, mode, cached ? 1 : 0, slot.failed ? 1 : 0,
+            tRead ? (unsigned long long)(tRead - t0) : 0ull,
+            (unsigned long long)(GetTickCount64() - t0), pathTail(path));
     if (gen != g_generation.load()) {                 // sort order changed mid-decode
         if (slot.bmp) DeleteObject(slot.bmp);
         return;
@@ -1193,7 +1292,7 @@ static void workerThread(bool lowAllowed) {
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                      IID_IWICImagingFactory, (void**)&fac);
     while (!g_quit) {
-        int idx = -1;
+        int idx = -1, hiDepth = 0, loDepth = 0;
         {
             std::unique_lock<std::mutex> lk(g_queueMx);
             g_queueCv.wait(lk, [lowAllowed] { return g_quit.load() || !g_queue.empty() ||
@@ -1207,18 +1306,26 @@ static void workerThread(bool lowAllowed) {
                 g_lowQueue.pop_front();
                 g_lowSet.erase(idx);
             } else continue;
+            g_inFlight.insert(idx);
+            hiDepth = (int)g_queue.size(); loDepth = (int)g_lowQueue.size();
         }
+        logLine("pop %d  high=%d low=%d", idx, hiDepth, loDepth);
+        bool skip = false;
         if (idx < THUMB_BASE) {
             std::lock_guard<std::mutex> lk(g_cacheMx);
-            if (g_cache.count(idx)) continue;      // already done
+            skip = g_cache.count(idx) != 0;        // already done
         } else if (idx < ZOOM_BASE) {
             std::lock_guard<std::mutex> lk(g_thumbMx);
-            if (g_thumbCache.count(idx - THUMB_BASE)) continue;
+            skip = g_thumbCache.count(idx - THUMB_BASE) != 0;
         }
-        if (fac) {
+        if (!skip && fac) {
             if (idx >= ZOOM_BASE) decodeOne(fac, idx - ZOOM_BASE, 1);
             else if (idx >= THUMB_BASE) decodeOne(fac, idx - THUMB_BASE, 2);
             else decodeOne(fac, idx, 0);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_queueMx);
+            g_inFlight.erase(idx);
         }
     }
     if (fac) fac->Release();
@@ -1237,8 +1344,23 @@ static void requestDecode(int idx, bool front) {
     }
     {
         std::lock_guard<std::mutex> lk(g_queueMx);
-        for (int q : g_queue) if (q == idx) return;
-        if (front) g_queue.push_front(idx); else g_queue.push_back(idx);
+        if (front) {
+            // the image on screen must be next in line: if an old read-ahead
+            // request for it is buried in the backlog, PROMOTE it instead of
+            // returning — otherwise held-arrow stalls until the whole backlog
+            // drains (was a real pause after long browses on slow drives)
+            for (auto qi = g_queue.begin(); qi != g_queue.end(); ++qi)
+                if (*qi == idx) {
+                    logLine("bump item=%d from queue depth %d", idx, (int)(qi - g_queue.begin()));
+                    g_queue.erase(qi);
+                    break;
+                }
+            g_queue.push_front(idx);
+        } else {
+            if (g_inFlight.count(idx)) return;   // a worker is already on it
+            for (int q : g_queue) if (q == idx) return;
+            g_queue.push_back(idx);
+        }
     }
     g_queueCv.notify_one();
 }
@@ -1260,11 +1382,13 @@ static void requestThumb(int idx, bool front) {
     {
         std::lock_guard<std::mutex> lk(g_queueMx);
         int key = THUMB_BASE + idx;
-        if (front) {
-            // visible grid cells ride the high-priority queue: decoded in
-            // parallel by all workers, behind pending fullscreen decodes.
-            // Background read-ahead stays on the single low-priority worker
-            // so slow drives never seek-storm.
+        if (front && !g_slowDrive) {
+            g_lowQueue.push_front(key);          // duplicates fine: worker re-checks cache
+        } else if (front) {
+            // slow drive: background read-ahead is confined to the single
+            // low-priority worker (no seek storm), so visible grid cells ride
+            // the high-priority queue instead — decoded in parallel by all
+            // workers, behind pending fullscreen decodes.
             for (int q : g_queue) if (q == key) return;
             g_queue.push_back(key);
         } else {
@@ -1295,6 +1419,7 @@ static void preloadThumbs() {
             added++;
         }
     }
+    logLine("preload queued %d thumbs", added);
     g_queueCv.notify_all();
 }
 
@@ -1356,6 +1481,7 @@ static void setCurrent(int pos) {
     pos = std::max(0, std::min(n - 1, pos));
     if (pos > g_cur) g_lastDir = 1; else if (pos < g_cur) g_lastDir = -1;
     g_cur = pos;
+    logLine("nav view=%d item=%d", g_cur, g_view[g_cur]);
     if (g_items[g_view[g_cur]].rating == -2) requestSidecar(g_view[g_cur]);
     prefetchAround();
     pruneCache();
@@ -2296,7 +2422,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
+        ULONGLONG t0 = GetTickCount64();
         paint(dc);
+        ULONGLONG ms = GetTickCount64() - t0;
+        if (ms > 30) logLine("SLOW paint %llums grid=%d", (unsigned long long)ms, g_gridMode ? 1 : 0);
         EndPaint(h, &ps);
         return 0; }
     case WM_ERASEBKGND: return 1;
@@ -2357,8 +2486,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if ((l & (1 << 30)) && !g_gridMode && (act == A_NEXT || act == A_PREV)) {
                 std::lock_guard<std::mutex> lk(g_cacheMx);
                 auto c = g_cache.find(curItem());
-                if (c == g_cache.end() || (!c->second.bmp && !c->second.failed))
+                if (c == g_cache.end() || (!c->second.bmp && !c->second.failed)) {
+                    logLine("swallow item=%d", curItem());
                     return 0;                      // swallow this repeat, keep frame up
+                }
             }
             doAction(act);
         }
@@ -2620,6 +2751,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     if (g_folder.empty() && !pickFolder(g_folder)) return 0;
     while (!g_folder.empty() && (g_folder.back() == L'\\' || g_folder.back() == L'/'))
         g_folder.pop_back();
+    g_slowDrive = driveIsSlow(g_folder);
+    logLine("start  folder=%ls  slowdrive=%d", g_folder.c_str(), g_slowDrive ? 1 : 0);
     WritePrivateProfileStringW(L"state", L"lastfolder", g_folder.c_str(), g_iniPath.c_str());
     {   // migrate a JustRate-era per-folder session file to the new name
         std::wstring oldSes = g_folder + L"\\justrate.session";
@@ -2660,10 +2793,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     std::thread scWorker(sidecarThread);
     unsigned nWorkers = std::max(2u, std::min(4u, std::thread::hardware_concurrency() / 2));
     std::vector<std::thread> workers;
-    // worker 0 is the only one allowed to take low-priority (thumbnail preload)
-    // jobs; the rest serve the high queue exclusively, so a fresh arrow-press
-    // decode never waits behind background thumbnails on a slow drive
-    for (unsigned i = 0; i < nWorkers; i++) workers.emplace_back(workerThread, i == 0);
+    // slow drive: worker 0 is the only one allowed to take low-priority
+    // (thumbnail preload) jobs — one sequential reader, no seek storm — and the
+    // rest serve the high queue exclusively so a fresh arrow-press decode never
+    // waits behind background thumbnails. Fast drives: all workers take both.
+    for (unsigned i = 0; i < nWorkers; i++)
+        workers.emplace_back(workerThread, !g_slowDrive || i == 0);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
