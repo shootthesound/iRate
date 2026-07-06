@@ -1,0 +1,16 @@
+# build artifacts
+*.exe
+*.pdb
+
+# test raws (owner's + CC0 regression suite) and XMP sidecars
+other raws/
+*.ARW
+*.arw
+*.xmp
+
+# local config and per-job state (old and new names)
+justrate.ini
+irate.ini
+justrate.session
+irate.session
+*.jrc
