@@ -76,8 +76,19 @@ x:xmptk="iRate 1.0".
   interface is hand-declared — mingw headers lack it; GUID 3B16811B-6A43-4ec9-B713-
   3D5A0C13B940, vtable: CopyPixels, GetClosestSize, GetClosestPixelFormat,
   DoesSupportTransform; falls back to scaler if QI fails).
-- Two queues: high (fullscreen images + 100% zoom) drained before low (thumbnails).
-  Generation counter invalidates in-flight decodes across sort changes.
+- Two queues: high (fullscreen images, 100% zoom, VISIBLE grid thumbs) drained
+  before low (background thumbnail read-ahead/preload). Only worker 0 may take
+  low-priority jobs — the other workers serve the high queue exclusively, so a
+  fresh arrow-press decode never queues behind background thumbnails and slow
+  (USB/spinning) drives never see a multi-reader seek storm. Generation counter
+  invalidates in-flight decodes across sort changes.
+- ALL sidecar I/O is async on a dedicated sidecarThread (reads + FIFO writes,
+  writes drain first and are flushed on exit). The UI thread NEVER touches the
+  photo drive: paint/setCurrent request loads, rating keys queue saves. A field
+  rated before its sidecar loaded is written as kXmpKeep (preserves what's on
+  disk) and read back after the patch. Slow-drive lag fix, July 2026.
+- scanDir skips `*.lrdata` directories (Lightroom preview pyramids: thousands of
+  useless dirents on shoot folders that hold an LR catalog).
 - Thumb disk cache `irate_thumbs.jrc`: append-log of {pathHash(FNV-1a of
   RELATIVE lowercased path), mtime, fsize, w, h, len, jpeg}. "JRTC" magic (kept
   across the rename — it's a format tag, not branding). Later entries win.

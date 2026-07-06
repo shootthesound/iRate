@@ -113,6 +113,7 @@ static const int THUMB_BASE = 1 << 27;
 #define WM_APP_ZOOMED   (WM_APP + 3)
 #define WM_APP_THUMB    (WM_APP + 4)
 #define WM_APP_SIDECARS (WM_APP + 5)
+#define WM_APP_SIDECAR1 (WM_APP + 6)   // one item's sidecar loaded/patched async
 
 // filtered view: view positions -> item indices; g_cur is a VIEW position
 static std::vector<int> g_view;
@@ -203,13 +204,83 @@ static void loadSidecar(Item& it) {
     if (readWholeFile(sidecarPath(it.path), content)) xmpParse(content, r, l);
     it.rating = r; it.label = l;
 }
-static void saveSidecar(Item& it) {
-    std::wstring sp = sidecarPath(it.path);
-    std::string content;
-    readWholeFile(sp, content);
-    std::string out = xmpApply(content, it.rating == -2 ? 0 : it.rating,
-                               it.label < 0 ? 0 : it.label);
-    writeWholeFileAtomic(sp, out);
+// async sidecar I/O: reads and writes happen on a dedicated thread so the UI
+// thread never touches the (possibly slow) photo drive. Writes are FIFO and
+// flushed before exit. rating/label of kXmpKeep = field not yet known here;
+// xmpApply then leaves whatever the sidecar already says untouched.
+struct ScWrite { int idx; std::wstring path; int rating; int label; };
+static std::deque<int> g_scReadQ;
+static std::set<int> g_scReadSet;
+static std::deque<ScWrite> g_scWriteQ;
+static std::mutex g_scMx;
+static std::condition_variable g_scCv;
+
+static void requestSidecar(int idx) {
+    {
+        std::lock_guard<std::mutex> lk(g_scMx);
+        if (g_scReadSet.count(idx)) return;
+        g_scReadQ.push_back(idx);
+        g_scReadSet.insert(idx);
+    }
+    g_scCv.notify_one();
+}
+static void queueSidecarSave(int idx, const std::wstring& path, int rating, int label) {
+    {
+        std::lock_guard<std::mutex> lk(g_scMx);
+        g_scWriteQ.push_back({ idx, path, rating, label });
+    }
+    g_scCv.notify_one();
+}
+static void sidecarThread() {
+    for (;;) {
+        ScWrite wr; int rdIdx = -1; bool haveWr = false;
+        {
+            std::unique_lock<std::mutex> lk(g_scMx);
+            g_scCv.wait(lk, [] { return g_quit.load() || !g_scWriteQ.empty() || !g_scReadQ.empty(); });
+            if (g_quit && g_scWriteQ.empty()) break;      // flush writes, drop reads
+            if (!g_scWriteQ.empty()) {                    // writes always drain first
+                wr = std::move(g_scWriteQ.front()); g_scWriteQ.pop_front(); haveWr = true;
+            } else {
+                rdIdx = g_scReadQ.front(); g_scReadQ.pop_front(); g_scReadSet.erase(rdIdx);
+            }
+        }
+        if (haveWr) {
+            std::wstring sp = sidecarPath(wr.path);
+            std::string content;
+            readWholeFile(sp, content);
+            std::string out = xmpApply(content, wr.rating, wr.label);
+            writeWholeFileAtomic(sp, out);
+            if (wr.rating == kXmpKeep || wr.label == kXmpKeep) {
+                // rated before the sidecar loaded: adopt what the patched
+                // sidecar actually says for the still-unknown field
+                int r = 0, l = 0; xmpParse(out, r, l);
+                {
+                    std::lock_guard<std::mutex> lk(g_itemsMx);
+                    if (wr.idx >= 0 && wr.idx < (int)g_items.size()) {
+                        if (wr.rating == kXmpKeep && g_items[wr.idx].rating == -2) g_items[wr.idx].rating = r;
+                        if (wr.label == kXmpKeep && g_items[wr.idx].label < 0) g_items[wr.idx].label = l;
+                    }
+                }
+                PostMessageW(g_hwnd, WM_APP_SIDECAR1, (WPARAM)wr.idx, 0);
+            }
+            continue;
+        }
+        std::wstring path;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMx);
+            if (rdIdx < 0 || rdIdx >= (int)g_items.size() || g_items[rdIdx].rating != -2) continue;
+            path = g_items[rdIdx].path;
+        }
+        std::string content; int r = 0, l = 0;
+        if (readWholeFile(sidecarPath(path), content)) xmpParse(content, r, l);
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMx);
+            if (rdIdx < (int)g_items.size() && g_items[rdIdx].rating == -2) {
+                g_items[rdIdx].rating = r; g_items[rdIdx].label = l;
+            }
+        }
+        PostMessageW(g_hwnd, WM_APP_SIDECAR1, (WPARAM)rdIdx, 0);
+    }
 }
 
 static std::wstring sessionFile() { return g_folder + L"\\irate.session"; }
@@ -509,6 +580,8 @@ static void scanDir(const std::wstring& dir, std::vector<Item>& out) {
     do {
         if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            size_t nl = wcslen(fd.cFileName);      // skip Lightroom preview trees:
+            if (nl >= 7 && !_wcsicmp(fd.cFileName + nl - 7, L".lrdata")) continue;
             scanDir(dir + L"\\" + fd.cFileName, out);
         } else if (hasWantedExt(fd.cFileName)) {
             Item it;
@@ -1114,7 +1187,7 @@ static void decodeOne(IWICImagingFactory* fac, int idx, int mode) {
     PostMessageW(g_hwnd, WM_APP_DECODED, (WPARAM)idx, 0);
 }
 
-static void workerThread() {
+static void workerThread(bool lowAllowed) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IWICImagingFactory* fac = nullptr;
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -1123,16 +1196,17 @@ static void workerThread() {
         int idx = -1;
         {
             std::unique_lock<std::mutex> lk(g_queueMx);
-            g_queueCv.wait(lk, [] { return g_quit.load() || !g_queue.empty() || !g_lowQueue.empty(); });
+            g_queueCv.wait(lk, [lowAllowed] { return g_quit.load() || !g_queue.empty() ||
+                                                     (lowAllowed && !g_lowQueue.empty()); });
             if (g_quit) break;
             if (!g_queue.empty()) {
                 idx = g_queue.front();
                 g_queue.pop_front();
-            } else {
+            } else if (lowAllowed && !g_lowQueue.empty()) {
                 idx = g_lowQueue.front();
                 g_lowQueue.pop_front();
                 g_lowSet.erase(idx);
-            }
+            } else continue;
         }
         if (idx < THUMB_BASE) {
             std::lock_guard<std::mutex> lk(g_cacheMx);
@@ -1187,14 +1261,19 @@ static void requestThumb(int idx, bool front) {
         std::lock_guard<std::mutex> lk(g_queueMx);
         int key = THUMB_BASE + idx;
         if (front) {
-            g_lowQueue.push_front(key);          // duplicates fine: worker re-checks cache
+            // visible grid cells ride the high-priority queue: decoded in
+            // parallel by all workers, behind pending fullscreen decodes.
+            // Background read-ahead stays on the single low-priority worker
+            // so slow drives never seek-storm.
+            for (int q : g_queue) if (q == key) return;
+            g_queue.push_back(key);
         } else {
             if (g_lowSet.count(key)) return;
             g_lowQueue.push_back(key);
             g_lowSet.insert(key);
         }
     }
-    g_queueCv.notify_one();
+    g_queueCv.notify_all();   // _all: only worker 0 may take low-priority jobs
 }
 
 // queue thumbnails for the whole (filtered) set in the background, nearest first
@@ -1277,7 +1356,7 @@ static void setCurrent(int pos) {
     pos = std::max(0, std::min(n - 1, pos));
     if (pos > g_cur) g_lastDir = 1; else if (pos < g_cur) g_lastDir = -1;
     g_cur = pos;
-    loadSidecar(g_items[g_view[g_cur]]);
+    if (g_items[g_view[g_cur]].rating == -2) requestSidecar(g_view[g_cur]);
     prefetchAround();
     pruneCache();
     if (g_gridMode) gridEnsureVisible();
@@ -1535,7 +1614,7 @@ static void paintGrid(HDC mem) {
         }
         // caption: stars + label dot
         Item& item = g_items[itemIdx];
-        if (item.rating < 0) loadSidecar(item);
+        if (item.rating == -2) requestSidecar(itemIdx);   // async: paint never blocks on the drive
         RECT cap{ cx + pad, cy + pad + g_thumbBoxH, cx + g_cellW - pad, cy + g_cellH - MulDiv(4, g_dpi, 96) };
         std::wstring stars;
         if (item.rating == -1) {
@@ -2167,9 +2246,9 @@ static void doAction(Action a) {
         InvalidateRect(g_hwnd, nullptr, FALSE);
         break; }
     case A_RATE0: case A_RATE1: case A_RATE2: case A_RATE3: case A_RATE4: case A_RATE5: {
-        loadSidecar(it);
         it.rating = a - A_RATE0;
-        saveSidecar(it);
+        queueSidecarSave(g_view[g_cur], it.path, it.rating,
+                         it.label < 0 ? kXmpKeep : it.label);
         if (g_filter.active() && !passesFilter(it)) {
             rebuildView(true);
             setCurrent(g_cur);
@@ -2181,9 +2260,9 @@ static void doAction(Action a) {
         else InvalidateRect(g_hwnd, nullptr, FALSE);
         break; }
     case A_REJECT: {
-        loadSidecar(it);
         it.rating = (it.rating == -1) ? 0 : -1;
-        saveSidecar(it);
+        queueSidecarSave(g_view[g_cur], it.path, it.rating,
+                         it.label < 0 ? kXmpKeep : it.label);
         if (g_filter.active() && !passesFilter(it)) {
             rebuildView(true);
             setCurrent(g_cur);
@@ -2196,10 +2275,10 @@ static void doAction(Action a) {
         break; }
     case A_LABEL_RED: case A_LABEL_YELLOW: case A_LABEL_GREEN:
     case A_LABEL_BLUE: case A_LABEL_PURPLE: {
-        loadSidecar(it);
         int l = a - A_LABEL_RED + 1;
         it.label = (it.label == l) ? 0 : l;      // toggle like Lightroom
-        saveSidecar(it);
+        queueSidecarSave(g_view[g_cur], it.path,
+                         it.rating == -2 ? kXmpKeep : it.rating, it.label);
         if (g_filter.active() && !passesFilter(it)) {
             rebuildView(true);
             setCurrent(g_cur);
@@ -2448,6 +2527,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         rebuildView(true);
         if (g_filterOpen || g_filter.active()) InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_APP_SIDECAR1:
+        if (g_gridMode || (int)w == curItem()) InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_APP_SCANDONE: {
         rebuildView(false);
         int start = 0;
@@ -2575,9 +2657,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     SetForegroundWindow(g_hwnd);
 
     std::thread scanner(scanThread);
+    std::thread scWorker(sidecarThread);
     unsigned nWorkers = std::max(2u, std::min(4u, std::thread::hardware_concurrency() / 2));
     std::vector<std::thread> workers;
-    for (unsigned i = 0; i < nWorkers; i++) workers.emplace_back(workerThread);
+    // worker 0 is the only one allowed to take low-priority (thumbnail preload)
+    // jobs; the rest serve the high queue exclusively, so a fresh arrow-press
+    // decode never waits behind background thumbnails on a slow drive
+    for (unsigned i = 0; i < nWorkers; i++) workers.emplace_back(workerThread, i == 0);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -2611,8 +2697,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
 
     g_quit = true;
     g_queueCv.notify_all();
+    g_scCv.notify_all();
     scanner.join();
     for (auto& t : workers) t.join();
+    scWorker.join();                   // flushes any still-pending sidecar writes
     {
         std::lock_guard<std::mutex> lk(g_cacheMx);
         for (auto& kv : g_cache) if (kv.second.bmp) DeleteObject(kv.second.bmp);

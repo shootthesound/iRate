@@ -100,6 +100,10 @@ folder, or for already-imported photos: Metadata → Read Metadata from Files.
 - Holding an arrow key cycles as fast as decoding keeps up: repeats are absorbed dynamically while
   a preview is still decoding, and the last image stays on screen — no black frames. The rate
   rises again automatically the moment the system speeds up.
+- Slow drives (USB spinning disks, network shares) stay responsive: background thumbnail
+  preloading is limited to a single reader so it never fights your browsing for the disk, the
+  image you're on always decodes first, and ratings are written in the background — keys never
+  wait on the drive. Lightroom `.lrdata` preview folders are skipped when scanning.
 
 ## Notes
 
