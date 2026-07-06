@@ -83,6 +83,8 @@ Use the Prefs panel (Shift+P). Every key is rebindable there — or in `irate.in
 prefer (multiple keys per action, comma separated; names like SLASH, LBRACKET, SHIFT+P or
 literal characters all work; restart after hand-edits). `autoadvance=` accepts `capslock` (default),
 `always`, `never`. `extensions=` controls scanned file types. Old ini files migrate automatically.
+If something ever feels slow, set `debuglog=1` and restart: the app writes timing diagnostics to
+`irate.log` next to the ini (per-image decode times, queue depths, UI stalls).
 
 ## Lightroom
 
@@ -105,6 +107,7 @@ folder, or for already-imported photos: Metadata → Read Metadata from Files.
   always decodes first. SSDs keep full parallel decoding. On all drives, ratings are written in
   the background — keys never wait on the drive — and Lightroom `.lrdata` preview folders are
   skipped when scanning.
+- Portrait (rotated) images decode as fast as landscape — including at 100% zoom.
 
 ## Notes
 

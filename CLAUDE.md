@@ -154,12 +154,36 @@ a decodable JPEG (and the BIG one for a7R5), EXIF present, plus XMP round-trip/
 patch/reject unit tests. Run after ANY core.h change. Check chosen preview
 DIMENSIONS (SOF scan), not just parse success — the CR2 thumbnail bug parsed "fine".
 
+## macOS port (NEXT UP, July 2026 — developed from a clone of this repo on the owner's Mac)
+
+- `core.h` ports AS-IS (pure C++, no Windows deps) and MUST stay platform-clean —
+  both shells share it. `test_core.cpp` compiles with clang out of the box; run it
+  against the sample raws as the first smoke test on the Mac.
+- The shell (`irate.cpp`, Win32 + WIC + GDI) gets rewritten on AppKit + ImageIO.
+  It is a REWRITE, not a translation — but carry these hard-won behaviours over:
+  1. EXIF rotation must be applied to MATERIALIZED pixels, never composed into a
+     lazy source chain (the Win32 shell lost 7s/image to exactly this — see the
+     WIC TRAP note above). On ImageIO, prefer CGImageSourceCreateThumbnailAtIndex
+     with kCGImageSourceCreateThumbnailWithTransform: it does downscale +
+     orientation in one step from the JPEG blob core.h hands you.
+  2. All sidecar I/O on a dedicated thread/queue (reads async, writes FIFO and
+     flushed on quit); the UI thread never touches the photo drive.
+  3. Drive-aware scheduling: one background thumbnail reader on seek-bound
+     drives, full parallelism on SSDs. macOS has no seek-penalty IOCTL; detect
+     via IOKit device characteristics, or measure first-read latency.
+  4. Decode request queues need: high before low, promote (don't drop) a re-
+     requested buried entry, and an in-flight set so workers never duplicate a
+     decode — but never dedupe the on-screen image's request.
+  5. Held-arrow repeats are swallowed while the current preview decodes (the
+     stateless per-repeat check) — the "never show black" guarantee.
+  6. One action table drives the help overlay AND the rebind UI.
+- Sidecar/XMP behaviour is already cross-platform (plain files); session/ini
+  need a Mac home (~/Library/Application Support/iRate) with the same
+  per-folder-vs-central choice.
+
 ## Known limits / possible future work
 
 - Sigma X3F, Hasselblad 3FR/FFF, Phase One IIQ, pre-2015 Fuji quirks: unsupported,
   add on demand (same candidate pattern).
 - Sort-by-date uses file mtime, not EXIF capture time (identical for card copies).
 - Nikon lens name lives in the makernote → lens field empty on some NEFs.
-- macOS port: NEXT UP (July 2026) — owner pulls this repo on his Mac. core.h ports
-  as-is; the Win32 shell (~1500 lines of irate.cpp) gets rewritten on
-  AppKit/ImageIO. Keep core.h strictly platform-clean so both shells share it.
