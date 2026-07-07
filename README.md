@@ -75,8 +75,12 @@ frames becomes a rhythm, not a chore.
 
 Ratings and labels are written as **XMP sidecars** — the same `xmp:Rating` and
 `xmp:Label` that **Lightroom, Bridge and Photo Mechanic** read. Cull in iRate at full
-speed, then import into Lightroom and your stars and colours are simply *there*
-(already imported? **Metadata → Read Metadata from Files**).
+speed, then import into Lightroom and your stars and colours are simply *there*.
+
+**Photos already in your Lightroom catalog?** After culling in iRate: Library module →
+Grid view (G) → select the photos (Ctrl+A / Cmd+A) → **Metadata → Read Metadata from
+Files** → confirm. Your stars and labels appear. (Lightroom never auto-reads sidecar
+changes from disk — this one menu step is always how you pull them in.)
 
 - Existing sidecars are **patched in place** — develop settings you've already made
   survive untouched.
