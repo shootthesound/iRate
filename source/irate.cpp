@@ -2776,6 +2776,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"iRateWnd";
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));   // embedded via irate.rc
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassW(&wc);

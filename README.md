@@ -5,7 +5,7 @@
 ### Rate your images blazingly fast, the way it should be.
 
 **The fastest way from a full memory card to a rated shoot.**
-Free · native · tiny · your raws are never touched.
+Free · open source (MIT) · native · tiny · your raws are never touched.
 
 <a href="https://github.com/shootthesound/iRate/releases/download/macos-v1.0/iRate-macos-1.0.zip"><img src="https://img.shields.io/badge/Download%20for%20macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
 <a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.0/iRate-windows-1.0.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
@@ -54,7 +54,7 @@ On top of that:
   and the contact sheet is simply *there*.
 - **Native code, one tiny binary, zero dependencies.** AppKit + ImageIO on the Mac,
   Win32 + WIC on Windows. No Electron, no runtime, nothing to install. The Windows
-  build is a single 620KB exe.
+  build is a single 700KB exe.
 
 ## Built for the cull
 
@@ -150,8 +150,8 @@ and it cross-compiles from anywhere).
 
 ## Support
 
-iRate is free. If it gives you your evenings back, you can support development with
-a coffee — entirely optional:
+iRate is free and MIT-licensed. If it gives you your evenings back, you can support
+development with a coffee — entirely optional:
 
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 
