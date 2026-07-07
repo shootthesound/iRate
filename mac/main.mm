@@ -429,12 +429,12 @@ static void writeIni() {
     fclose(f);
 }
 // Bind a key to an action: steal it from any other action, add it here, persist.
+// Rebind = REPLACE: the action's previous key(s) are dropped, and the new key is
+// stolen from whatever other action held it. One action ends up with one key.
 static void bindActionToKey(Action a, const KeySpec& k) {
-    for (auto it = g_keymap.begin(); it != g_keymap.end(); )   // steal from others
-        if (it->first == k) it = g_keymap.erase(it); else ++it;
-    bool have = false;
-    for (auto& kv : g_keymap) if (kv.second == a && kv.first == k) have = true;
-    if (!have) g_keymap.push_back({ k, a });
+    for (auto it = g_keymap.begin(); it != g_keymap.end(); )
+        if (it->second == a || it->first == k) it = g_keymap.erase(it); else ++it;
+    g_keymap.push_back({ k, a });
     writeIni();
 }
 
@@ -1113,6 +1113,22 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     g_gridScrollY -= e.scrollingDeltaY;
     [self setNeedsDisplay:YES];
 }
+// Mouse-follow panning for the 100% zoom (matches the Windows build).
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea* ta in [self.trackingAreas copy]) [self removeTrackingArea:ta];
+    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:self.bounds
+        options:NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+        owner:self userInfo:nil]];
+}
+- (void)mouseMoved:(NSEvent*)e {
+    if (!g_zoom) return;
+    NSPoint pt = [self convertPoint:e.locationInWindow fromView:nil];
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    g_zoomCenter.x = std::max((CGFloat)0, std::min((CGFloat)1, pt.x / w));
+    g_zoomCenter.y = std::max((CGFloat)0, std::min((CGFloat)1, 1 - pt.y / h));  // view y-up → image y-down
+    [self setNeedsDisplay:YES];
+}
 
 - (void)drawRect:(NSRect)dirty {
     CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
@@ -1126,13 +1142,13 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
         if (g_filterOpen) [self drawFilter:ctx bounds:b]; return; }
 
     if (_image) {
-        if (g_zoom) {
-            // 100% loupe on the full-res preview (falls back to the fit image until
-            // the full decode lands): 1 image px per backing px, panned by g_zoomCenter.
-            CGImageRef zi = g_zoomImage ? g_zoomImage : _image;
+        if (g_zoom && g_zoomImage) {
+            // True 100%: 1 full-res preview pixel per backing pixel, panned around
+            // g_zoomCenter (follows the mouse). A single zoom level, like Windows.
+            CGImageRef zi = g_zoomImage;
             CGFloat iw = CGImageGetWidth(zi), ih = CGImageGetHeight(zi);
             CGFloat scale = self.window.backingScaleFactor ?: 1;
-            CGFloat vw = b.size.width * scale, vh = b.size.height * scale;   // px shown
+            CGFloat vw = b.size.width * scale, vh = b.size.height * scale;   // image px shown
             CGFloat sx = std::min(iw, vw), sy = std::min(ih, vh);
             CGFloat ox = std::max((CGFloat)0, std::min(iw - sx, g_zoomCenter.x * iw - sx / 2));
             CGFloat oy = std::max((CGFloat)0, std::min(ih - sy, g_zoomCenter.y * ih - sy / 2));
@@ -1145,12 +1161,21 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
                 CGImageRelease(crop);
             }
         } else {
+            // Fit view (also the zoom "loading" state — Windows keeps the fit image
+            // up with a "100% loading…" label until the full-res decode lands).
             CGFloat iw = CGImageGetWidth(_image), ih = CGImageGetHeight(_image);
             CGFloat s = std::min(b.size.width / iw, b.size.height / ih);
             CGFloat dw = iw * s, dh = ih * s;
             CGRect dst = CGRectMake((b.size.width - dw) / 2, (b.size.height - dh) / 2, dw, dh);
             CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
             CGContextDrawImage(ctx, dst, _image);
+        }
+        if (g_zoom) {   // "100%" / "100% loading…" indicator, like Windows
+            NSString* zt = g_zoomImage ? @"100%" : @"100% loading…";
+            CGFloat zy = g_infoTop && g_showInfo ? b.size.height - 34 - 22 : b.size.height - 26;
+            [zt drawAtPoint:NSMakePoint(12, zy) withAttributes:@{
+                NSFontAttributeName: [NSFont systemFontOfSize:13],
+                NSForegroundColorAttributeName: [NSColor whiteColor] }];
         }
     }
 
@@ -1709,6 +1734,7 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     self.window.level = NSMainMenuWindowLevel + 1;
     self.window.backgroundColor = [NSColor blackColor];
     self.window.opaque = YES;
+    self.window.acceptsMouseMovedEvents = YES;   // for zoom mouse-follow panning
     [self.window setFrame:frame display:YES];
 
     self.view = [[IRView alloc] initWithFrame:frame];
