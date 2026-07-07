@@ -19,8 +19,9 @@ Free · native · tiny · your raws are never touched.
 
 ## Why "iRate"
 
-I shoot motorsport. A race weekend comes home as **thousands of raw frames**, and every one
-of them deserves two seconds of my attention — not two seconds of *loading*.
+I shoot events — the kind where I come home with **thousands of raw images from a single
+day or weekend**, and every one of them deserves two seconds of my attention — not two
+seconds of *loading*.
 
 Culling in Lightroom meant: import, wait for previews to build, watch the loupe hitch
 between frames, feel the rating keys lag behind my fingers, repeat until midnight.
