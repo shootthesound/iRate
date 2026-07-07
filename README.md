@@ -7,8 +7,8 @@
 **The fastest way from a full memory card to a rated shoot.**
 Free · open source (MIT) · native · tiny · your raws are never touched.
 
-<a href="https://github.com/shootthesound/iRate/releases/download/macos-v1.0/iRate-macos-1.0.zip"><img src="https://img.shields.io/badge/Download%20for%20macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
-<a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.0/iRate-windows-1.0.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
+<a href="https://github.com/shootthesound/iRate/releases/download/macos-v1.0.1/iRate-macos-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
+<a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.0.1/iRate-windows-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 
 *macOS 11+ (Apple Silicon & Intel) · Windows 10/11 x64 · [all releases](https://github.com/shootthesound/iRate/releases)*
@@ -117,7 +117,7 @@ that's a bug — open an issue.
 
 ### macOS
 
-1. **[Download](https://github.com/shootthesound/iRate/releases/download/macos-v1.0/iRate-macos-1.0.zip)**, unzip, drop **iRate.app** into Applications.
+1. **[Download](https://github.com/shootthesound/iRate/releases/download/macos-v1.0.1/iRate-macos-1.0.1.zip)**, unzip, drop **iRate.app** into Applications.
 2. First launch only: **right-click → Open** (the build is ad-hoc signed, not
    notarized). If macOS claims it's "damaged":
    `xattr -dr com.apple.quarantine /path/to/iRate.app`
@@ -129,7 +129,7 @@ Settings live in `~/Library/Application Support/iRate/`. Build from source:
 
 ### Windows
 
-1. **[Download](https://github.com/shootthesound/iRate/releases/download/windows-v1.0/iRate-windows-1.0.zip)**, unzip anywhere — it's a single portable exe.
+1. **[Download](https://github.com/shootthesound/iRate/releases/download/windows-v1.0.1/iRate-windows-1.0.1.zip)**, unzip anywhere — it's a single portable exe.
 2. First launch only: if SmartScreen objects, **More info → Run anyway** (unsigned build).
 3. Double-click and pick a folder — or drag a folder onto the exe, or
    `iRate.exe "E:\Shoot"`.
