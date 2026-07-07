@@ -15,3 +15,5 @@ justrate.session
 irate.session
 *.jrc
 CLAUDE.md
+*.obj
+*.res
