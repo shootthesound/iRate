@@ -11,7 +11,7 @@ Free · open source (MIT) · native · tiny · your raws are never touched.
 <a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.0.1/iRate-windows-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 
-*macOS 11+ (Apple Silicon & Intel) · Windows 10/11 x64 · [all releases](https://github.com/shootthesound/iRate/releases)*
+*macOS 11+ (Apple Silicon / M-series) · Windows 10/11 x64 · [all releases](https://github.com/shootthesound/iRate/releases)*
 
 **The only key you have to remember is H — it shows you all the others.**
 
