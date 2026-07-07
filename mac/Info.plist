@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>iRate</string>
+    <key>CFBundleDisplayName</key>
+    <string>iRate</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.shootthesound.irate</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>iRate</string>
+    <key>CFBundleIconFile</key>
+    <string>iRate</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <!-- Shown in the TCC prompt when iRate first reaches a protected location
+         (Desktop / Documents / removable / network volume). -->
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>iRate reads the raw photos in the folder you choose.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>iRate reads the raw photos in the folder you choose.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>iRate reads the raw photos in the folder you choose.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>iRate reads raw photos from the card or drive you choose.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>iRate reads raw photos from the network volume you choose.</string>
+</dict>
+</plist>
