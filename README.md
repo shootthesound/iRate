@@ -2,7 +2,7 @@
 
 # ⭐ iRate
 
-### Look at the frame. Press a number. Next frame.
+### Rate your images blazingly fast, the way it should be.
 
 **The fastest way from a full memory card to a rated shoot.**
 Free · native · tiny · your raws are never touched.
