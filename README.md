@@ -13,6 +13,8 @@ Free · open source (MIT) · native · tiny · your raws are never touched.
 
 *macOS 11+ (Apple Silicon & Intel) · Windows 10/11 x64 · [all releases](https://github.com/shootthesound/iRate/releases)*
 
+**The only key you have to remember is H — it shows you all the others.**
+
 </div>
 
 ---
