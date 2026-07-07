@@ -1983,8 +1983,8 @@ static void paintPrefs(HDC mem) {
     int colW = MulDiv(360, g_dpi, 96);
     int pad = MulDiv(20, g_dpi, 96);
     int optH = MulDiv(36, g_dpi, 96);
-    int w = colW * 2 + pad * 2;
-    int hgt = pad * 2 + optH * 4 + rowH * (perCol + 3) + MulDiv(40, g_dpi, 96);
+    int w = colW * 2 + pad * 2 + MulDiv(80, g_dpi, 96);   // widest row: 11 file-type chips
+    int hgt = pad * 2 + optH * 4 + rowH * (perCol + 4) + MulDiv(40, g_dpi, 96);
     RECT panel{ (g_scrW - w) / 2, std::max(MulDiv(20, g_dpi, 96), (g_scrH - hgt) / 2),
                 (g_scrW + w) / 2, std::max(MulDiv(20, g_dpi, 96), (g_scrH - hgt) / 2) + hgt };
     g_prefsRc = panel;
@@ -2047,28 +2047,29 @@ static void paintPrefs(HDC mem) {
     RECT rb{ rl.right + MulDiv(6, g_dpi, 96), y, rl.right + MulDiv(150, g_dpi, 96), y + chipH };
     drawBtn(mem, rb, g_sessionInFolder ? L"In photo folder" : L"Central ini", g_sessionInFolder);
     g_pchips.push_back({ rb, 6, 0 });
-    {
-        wchar_t cc[64];
-        double mb = tcSizeBytes() / (1024.0 * 1024.0);
-        swprintf(cc, 64, mb >= 1024.0 ? L"Clear thumb cache (%.1f GB)" : L"Clear thumb cache (%.0f MB)",
-                 mb >= 1024.0 ? mb / 1024.0 : mb);
-        RECT cb2{ rb.right + MulDiv(24, g_dpi, 96), y, rb.right + MulDiv(24 + 210, g_dpi, 96), y + chipH };
-        drawBtn(mem, cb2, cc, false);
-        g_pchips.push_back({ cb2, 7, 0 });
-    }
     y += optH;
     x = rowLabel(L"RAW+JPG", y);
     {
         RECT pj{ x, y, x + MulDiv(120, g_dpi, 96), y + chipH };
         drawBtn(mem, pj, g_pairRawJpg ? L"Paired (+JPG)" : L"Separate", g_pairRawJpg);
         g_pchips.push_back({ pj, 8, 0 });
-        SetTextColor(mem, RGB(150, 150, 150));
-        RECT nt{ pj.right + MulDiv(16, g_dpi, 96), y, panel.right - pad, y + chipH };
+        wchar_t cc[64];
+        double mb = tcSizeBytes() / (1024.0 * 1024.0);
+        swprintf(cc, 64, mb >= 1024.0 ? L"Clear thumb cache (%.1f GB)" : L"Clear thumb cache (%.0f MB)",
+                 mb >= 1024.0 ? mb / 1024.0 : mb);
+        RECT cb2{ pj.right + MulDiv(24, g_dpi, 96), y, pj.right + MulDiv(24 + 210, g_dpi, 96), y + chipH };
+        drawBtn(mem, cb2, cc, false);
+        g_pchips.push_back({ cb2, 7, 0 });
+    }
+    y += optH;
+    SetTextColor(mem, RGB(150, 150, 150));
+    {
+        RECT nt{ panel.left + pad, y, panel.right - pad, y + rowH };
         DrawTextW(mem, L"Note: Reject (\x2716) writes xmp:Rating=\"-1\" \x2014 read by Bridge/Photo"
                        L" Mechanic; Lightroom ignores it (its flags are catalog-only)",
                   -1, &nt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    y += optH;
+    y += rowH;
 
     SetTextColor(mem, RGB(180, 180, 180));
     RECT kh{ panel.left + pad, y, panel.right - pad, y + rowH };
