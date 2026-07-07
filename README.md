@@ -30,6 +30,11 @@ The tool for looking at photographs was the slowest part of looking at photograp
 **Lightroom made me irate. So I built iRate.** The name is the entire spec: ***I rate***
 *photos, without becoming* ***irate***.
 
+The usual answer is Photo Mechanic — and it's a fine tool, but it costs **$139+** and
+carries a whole newsroom toolchain of contact sheets, IPTC stationery and ingest dialogs
+you have to work around just to rate pictures. iRate does the one job — and by doing
+*only* that job, it's **faster, less cumbersome, and free**.
+
 Everything in this app follows one rule — **nothing is allowed to be slower than you
 looking**. No import step. No preview building. No catalog. Open a folder, the first
 frame is on screen, and every keypress lands *now*.
