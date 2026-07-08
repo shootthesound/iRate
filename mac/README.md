@@ -111,6 +111,15 @@ Done (Milestone 10 — full filter panel + cache compaction):
 
 **The port is feature-complete** — nothing from the Windows build is left out.
 
+Done (Milestone 11 — keyword sets, Mac-first):
+- Up to 10 app-level keyword sets, each a key + comma-separated keywords; press
+  the key while culling to toggle those keywords on the current image (written
+  to the sidecar as a Lightroom-standard `dc:subject` bag via `core.h`).
+- Dedicated editor on **K**: click a key chip then press the key, ✕ unbinds,
+  click the field to type keywords. Saved in the app ini (`[keywords]`), NOT per
+  folder — sets follow you across shoots. Spec + Windows porting notes in
+  `docs/keyword-sets.md`.
+
 ## Icon
 
 `makeicon.mm` renders the 1024px master (a gold rating star on a dusk gradient
