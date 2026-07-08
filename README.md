@@ -5,7 +5,7 @@
 ### Rate your images blazingly fast, the way it should be.
 
 **The fastest way from a full memory card to a rated shoot.**
-Free · open source (MIT) · native · tiny · your raws are never touched.
+Free donationware · source on GitHub · native · tiny · your raws are never touched.
 
 <a href="https://github.com/shootthesound/iRate/releases/download/macos-v1.0.1/iRate-macos-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
 <a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.0.1/iRate-windows-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
@@ -69,6 +69,10 @@ Put **Caps Lock on** and rating auto-advances: look, press, look, press. A thous
 frames becomes a rhythm, not a chore.
 
 - **1–5** rate · **0** clear · **X** reject · **6/7/8/9/P** colour labels
+- **Keyword sets** (K): pair up to 10 keys with keyword lists (`F1` → *ceremony*,
+  `F2` → *speeches, top table*) and tap them while culling to toggle Lightroom-standard
+  keywords on the current image — keywording at rating speed, no typing per image.
+  Sets are app-level, so they follow you across shoots.
 - **G** grid with rating/label badges on every cell
 - **F** filter by rating, label, filename — rate a frame out of the filter and it
   leaves the view immediately
@@ -76,13 +80,15 @@ frames becomes a rhythm, not a chore.
 - Sort by name / date / size, flip direction, all one key each
 - **RAW+JPG pairs** collapse to a single entry (shown `+JPG`)
 - Quit any time — reopening lands on the exact frame, same sort, same view
-- Every single key is **rebindable** in-app (**Shift+P**); **H** shows your live bindings
+- Every single key is **rebindable** in-app (**Shift+P**) — including `Ctrl+` / `Alt+` /
+  `Shift+` combos — and the editors warn you about conflicts; **H** shows your live bindings
 
 ## It speaks fluent Lightroom
 
-Ratings and labels are written as **XMP sidecars** — the same `xmp:Rating` and
-`xmp:Label` that **Lightroom, Bridge and Photo Mechanic** read. Cull in iRate at full
-speed, then import into Lightroom and your stars and colours are simply *there*.
+Ratings, labels and keywords are written as **XMP sidecars** — the same `xmp:Rating`,
+`xmp:Label` and `dc:subject` that **Lightroom, Bridge and Photo Mechanic** read. Cull in
+iRate at full speed, then import into Lightroom and your stars, colours and keywords are
+simply *there*.
 
 **Photos already in your Lightroom catalog?** After culling in iRate: Library module →
 Grid view (G) → select the photos (Ctrl+A / Cmd+A) → **Metadata → Read Metadata from
@@ -118,6 +124,7 @@ that's a bug — open an issue.
 | G | grid ⇄ fullscreen |
 | / | 100% zoom |
 | F | filter |
+| K | keyword sets editor |
 | [ ] ; | sort mode / direction |
 | I · Z | info bar on-off · top-bottom |
 | Home / End | first / last |
@@ -161,8 +168,9 @@ and it cross-compiles from anywhere).
 
 ## Support
 
-iRate is free and MIT-licensed. If it gives you your evenings back, you can support
-development with a coffee — entirely optional:
+iRate is **donationware** — free to download and use, no locked features, no nags.
+The deal is simple: if it gives you your evenings back, buy me a coffee. That's the
+whole business model.
 
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 

@@ -96,6 +96,55 @@ int main(int argc, char** argv) {
         xmpParse(p6, rr, ll);
         if (rr != 2) { printf("FAIL xmp garbage fallback\n"); fails++; }
     }
+
+    // ---- keyword (dc:subject) tests
+    {
+        // fresh create + read back
+        std::string k1 = xmpApplyKeywords("", { "ceremony", "top table" });
+        auto kws = xmpGetKeywords(k1);
+        if (kws.size() != 2 || kws[0] != "ceremony" || kws[1] != "top table") {
+            printf("FAIL kw fresh create (%zu)\n", kws.size()); fails++;
+        }
+        int rr, ll; xmpParse(k1, rr, ll);
+        if (rr != 0 || ll != 0) { printf("FAIL kw fresh doc rating/label\n"); fails++; }
+
+        // escape round-trip
+        std::string k2 = xmpApplyKeywords(k1, { "R&D <crew>", "say \"cheese\"" });
+        kws = xmpGetKeywords(k2);
+        if (kws.size() != 2 || kws[0] != "R&D <crew>" || kws[1] != "say \"cheese\"") {
+            printf("FAIL kw escape roundtrip\n"); fails++;
+        }
+
+        // rating patch preserves keywords, keyword patch preserves rating
+        std::string k3 = xmpApply(k2, 4, 2);
+        kws = xmpGetKeywords(k3);
+        if (kws.size() != 2 || kws[0] != "R&D <crew>") { printf("FAIL kw lost on rating patch\n"); fails++; }
+        std::string k4 = xmpApplyKeywords(k3, { "solo" });
+        xmpParse(k4, rr, ll);
+        if (rr != 4 || ll != 2) { printf("FAIL rating lost on kw patch r=%d l=%d\n", rr, ll); fails++; }
+        kws = xmpGetKeywords(k4);
+        if (kws.size() != 1 || kws[0] != "solo") { printf("FAIL kw replace\n"); fails++; }
+
+        // empty list removes the block entirely
+        std::string k5 = xmpApplyKeywords(k4, {});
+        if (k5.find("dc:subject") != std::string::npos) { printf("FAIL kw clear leaves block\n"); fails++; }
+        if (!xmpGetKeywords(k5).empty()) { printf("FAIL kw clear readback\n"); fails++; }
+
+        // LR-style self-closing Description with crs settings: keywords added,
+        // crs preserved, xmlns:dc inserted
+        std::string lr2 =
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+            "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" "
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" xmp:Rating=\"3\" crs:Temperature=\"5500\"/>"
+            "</rdf:RDF></x:xmpmeta>";
+        std::string k6 = xmpApplyKeywords(lr2, { "podium" });
+        kws = xmpGetKeywords(k6);
+        if (kws.size() != 1 || kws[0] != "podium") { printf("FAIL kw self-closing insert\n%s\n", k6.c_str()); fails++; }
+        if (k6.find("crs:Temperature=\"5500\"") == std::string::npos) { printf("FAIL kw lost crs\n"); fails++; }
+        if (k6.find("xmlns:dc") == std::string::npos) { printf("FAIL kw missing dc ns\n"); fails++; }
+        xmpParse(k6, rr, ll);
+        if (rr != 3) { printf("FAIL kw self-closing rating r=%d\n", rr); fails++; }
+    }
     printf(fails ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", fails);
     return fails ? 1 : 0;
 }

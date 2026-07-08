@@ -4,6 +4,10 @@ Shipped first in the macOS shell; this doc is the spec for keeping the Windows
 shell in step. The shared XMP layer already lives in `source/core.h`, so the
 Windows port is UI + config only.
 
+**Status: both shells implement this spec** (macOS 2026-07, Windows 2026-07 —
+`source/irate.cpp`: keyword toggles run on the serial sidecar thread, editor
+overlay on K, conflict notices via `keyUsedBy`).
+
 ## What the user gets
 
 Culling-speed keywording: up to **10 keyword sets**, each pairing a **key** with

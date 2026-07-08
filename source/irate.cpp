@@ -56,7 +56,7 @@ enum Action {
     A_LABEL_RED, A_LABEL_YELLOW, A_LABEL_GREEN, A_LABEL_BLUE, A_LABEL_PURPLE,
     A_TOGGLE_INFO, A_QUIT,
     A_ZOOM, A_SORTNEXT, A_SORTPREV, A_SORTDIR, A_FILTER, A_GRID, A_INFOPOS, A_HELP, A_PREFS,
-    A_REJECT
+    A_REJECT, A_KEYWORDS
 };
 
 // ------------------------------------------------------------------ items
@@ -67,6 +67,7 @@ struct Item {
     int rating = -2;   // -2 = sidecar not read yet, -1 = rejected, 0..5 stars
     int label = -1;
     bool jpgTwin = false;   // paired RAW+JPG
+    std::vector<std::string> keywords;   // dc:subject, loaded with the sidecar
 };
 
 struct Slot {
@@ -231,6 +232,7 @@ static void loadSidecar(Item& it) {
     std::string content;
     int r = 0, l = 0;
     if (readWholeFile(sidecarPath(it.path), content)) xmpParse(content, r, l);
+    it.keywords = xmpGetKeywords(content);
     it.rating = r; it.label = l;
 }
 // async sidecar I/O: reads and writes happen on a dedicated thread so the UI
@@ -238,11 +240,28 @@ static void loadSidecar(Item& it) {
 // flushed before exit. rating/label of kXmpKeep = field not yet known here;
 // xmpApply then leaves whatever the sidecar already says untouched.
 struct ScWrite { int idx; std::wstring path; int rating; int label; };
+struct ScKw { int idx; std::wstring path; std::vector<std::string> setWords; };
 static std::deque<int> g_scReadQ;
 static std::set<int> g_scReadSet;
 static std::deque<ScWrite> g_scWriteQ;
+static std::deque<ScKw> g_scKwQ;           // keyword-set toggles (FIFO like writes)
 static std::mutex g_scMx;
 static std::condition_variable g_scCv;
+
+// read a sidecar we are about to PATCH. If the file exists but can't be read
+// (Lightroom/AV briefly holding it, short read), retry, then give up — never
+// fall through to a write, or xmpApply*() would build a fresh minimal sidecar
+// and atomically clobber the user's develop settings.
+static bool readSidecarForPatch(const std::wstring& sp, std::string& content) {
+    for (int tries = 0; tries < 3; tries++) {
+        if (readWholeFile(sp, content)) return true;
+        if (GetFileAttributesW(sp.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return true;                       // no sidecar yet: fresh one is correct
+        Sleep(50);
+    }
+    logLine("DROPPED sidecar patch: read kept failing  %ls", pathTail(sp));
+    return false;
+}
 
 static void requestSidecar(int idx) {
     {
@@ -260,24 +279,63 @@ static void queueSidecarSave(int idx, const std::wstring& path, int rating, int 
     }
     g_scCv.notify_one();
 }
+static void queueKeywordToggle(int idx, const std::wstring& path,
+                               const std::vector<std::string>& setWords) {
+    {
+        std::lock_guard<std::mutex> lk(g_scMx);
+        g_scKwQ.push_back({ idx, path, setWords });
+    }
+    g_scCv.notify_one();
+}
 static void sidecarThread() {
     for (;;) {
-        ScWrite wr; int rdIdx = -1; bool haveWr = false;
+        ScWrite wr; ScKw kw; int rdIdx = -1; bool haveWr = false, haveKw = false;
         {
             std::unique_lock<std::mutex> lk(g_scMx);
-            g_scCv.wait(lk, [] { return g_quit.load() || !g_scWriteQ.empty() || !g_scReadQ.empty(); });
-            if (g_quit && g_scWriteQ.empty()) break;      // flush writes, drop reads
+            g_scCv.wait(lk, [] { return g_quit.load() || !g_scWriteQ.empty() ||
+                                        !g_scKwQ.empty() || !g_scReadQ.empty(); });
+            if (g_quit && g_scWriteQ.empty() && g_scKwQ.empty()) break;   // flush writes+toggles, drop reads
             if (!g_scWriteQ.empty()) {                    // writes always drain first
                 wr = std::move(g_scWriteQ.front()); g_scWriteQ.pop_front(); haveWr = true;
+            } else if (!g_scKwQ.empty()) {
+                kw = std::move(g_scKwQ.front()); g_scKwQ.pop_front(); haveKw = true;
             } else {
                 rdIdx = g_scReadQ.front(); g_scReadQ.pop_front(); g_scReadSet.erase(rdIdx);
             }
+        }
+        if (haveKw) {
+            // toggle the set on the image's sidecar: all present -> remove
+            // the set's keywords, else add the missing ones. Other keywords
+            // are never touched; the full list is rewritten (core.h contract).
+            std::wstring sp = sidecarPath(kw.path);
+            std::string content;
+            if (!readSidecarForPatch(sp, content)) continue;   // never clobber
+            std::vector<std::string> kws = xmpGetKeywords(content);
+            bool all = true;
+            for (auto& w2 : kw.setWords)
+                if (std::find(kws.begin(), kws.end(), w2) == kws.end()) { all = false; break; }
+            if (all) {
+                for (auto& w2 : kw.setWords)
+                    kws.erase(std::remove(kws.begin(), kws.end(), w2), kws.end());
+            } else {
+                for (auto& w2 : kw.setWords)
+                    if (std::find(kws.begin(), kws.end(), w2) == kws.end()) kws.push_back(w2);
+            }
+            writeWholeFileAtomic(sp, xmpApplyKeywords(content, kws));
+            {
+                std::lock_guard<std::mutex> lk(g_itemsMx);
+                if (kw.idx >= 0 && kw.idx < (int)g_items.size() && g_items[kw.idx].path == kw.path)
+                    g_items[kw.idx].keywords = kws;
+            }
+            logLine("kw toggle item=%d -> %d keywords", kw.idx, (int)kws.size());
+            PostMessageW(g_hwnd, WM_APP_SIDECAR1, (WPARAM)kw.idx, 0);
+            continue;
         }
         if (haveWr) {
             ULONGLONG t0 = GetTickCount64();
             std::wstring sp = sidecarPath(wr.path);
             std::string content;
-            readWholeFile(sp, content);
+            if (!readSidecarForPatch(sp, content)) continue;   // never clobber
             std::string out = xmpApply(content, wr.rating, wr.label);
             writeWholeFileAtomic(sp, out);
             logLine("xmp write %llums  %ls", (unsigned long long)(GetTickCount64() - t0), pathTail(sp));
@@ -305,9 +363,11 @@ static void sidecarThread() {
         ULONGLONG t0 = GetTickCount64();
         std::string content; int r = 0, l = 0;
         if (readWholeFile(sidecarPath(path), content)) xmpParse(content, r, l);
+        std::vector<std::string> kws = xmpGetKeywords(content);
         {
             std::lock_guard<std::mutex> lk(g_itemsMx);
             if (rdIdx < (int)g_items.size() && g_items[rdIdx].rating == -2) {
+                g_items[rdIdx].keywords = std::move(kws);
                 g_items[rdIdx].rating = r; g_items[rdIdx].label = l;
             }
         }
@@ -364,7 +424,48 @@ static void rebuildView(bool keepCurrent) {
 }
 
 // ------------------------------------------------------------------ config
-static const UINT KM_SHIFT = 0x20000;      // modifier flag in keymap keys
+// modifier flag bits in keymap keys (VK codes stay below 0x10000).
+// Grammar + cross-platform token mapping: docs/key-bindings.md (CMD+ = Win key)
+static const UINT KM_SHIFT = 0x20000;
+static const UINT KM_CTRL  = 0x40000;
+static const UINT KM_ALT   = 0x80000;
+static const UINT KM_WIN   = 0x100000;
+
+static UINT heldMods() {
+    UINT m = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000)   m |= KM_SHIFT;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= KM_CTRL;
+    if (GetKeyState(VK_MENU) & 0x8000)    m |= KM_ALT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) m |= KM_WIN;
+    return m;
+}
+
+// keyword sets: up to 10 app-level key -> keyword-list slots, toggled on the
+// current image while culling. Spec: docs/keyword-sets.md. Stored in the app
+// ini ([keywords]) so they follow the photographer across shoots.
+struct KwSlot { UINT key = 0; std::wstring words; };   // empty words = unused
+static KwSlot g_kwSlots[10];
+static bool g_kwOpen = false;              // keyword editor overlay
+static int g_kwCapture = -1;               // slot capturing a key, -1 = none
+static HWND g_kwEdit = nullptr;            // active words-field edit control
+static int g_kwEditSlot = -1;
+static std::wstring g_kwMsg;               // conflict notice in the editor
+static std::wstring g_prefsMsg;            // conflict notice in prefs rebind header
+
+static std::vector<std::string> splitKeywords(const std::wstring& words) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= words.size()) {
+        size_t comma = words.find(L',', start);
+        std::wstring one = words.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+        while (!one.empty() && iswspace(one.front())) one.erase(one.begin());
+        while (!one.empty() && iswspace(one.back())) one.pop_back();
+        if (!one.empty()) out.push_back(wideToUtf8(one));
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return out;
+}
 struct KeyName { const wchar_t* name; UINT vk; };
 static const KeyName kKeyNames[] = {
     {L"LEFT", VK_LEFT}, {L"RIGHT", VK_RIGHT}, {L"UP", VK_UP}, {L"DOWN", VK_DOWN},
@@ -391,8 +492,18 @@ static UINT parseKeyName(std::wstring s) {
     while (!s.empty() && iswspace(s.back())) s.pop_back();
     if (s.empty()) return 0;
     UINT mod = 0;
-    if (s.rfind(L"SHIFT+", 0) == 0) { mod = KM_SHIFT; s = s.substr(6); }
-    if (!s.empty() && mod) {
+    for (bool more = true; more && !s.empty();) {   // any number, any order
+        more = false;
+        struct Pfx { const wchar_t* t; UINT m; };
+        static const Pfx kPfx[] = {
+            {L"SHIFT+", KM_SHIFT}, {L"CTRL+", KM_CTRL}, {L"CONTROL+", KM_CTRL},
+            {L"ALT+", KM_ALT}, {L"OPT+", KM_ALT}, {L"OPTION+", KM_ALT},
+            {L"CMD+", KM_WIN}, {L"COMMAND+", KM_WIN}, {L"WIN+", KM_WIN},
+        };
+        for (auto& p : kPfx)
+            if (s.rfind(p.t, 0) == 0) { mod |= p.m; s = s.substr(wcslen(p.t)); more = true; break; }
+    }
+    if (mod) {
         UINT base = parseKeyName(s);
         return base ? (base | mod) : 0;
     }
@@ -462,6 +573,7 @@ L"sortnext=RBRACKET\r\n"
 L"sortprev=LBRACKET\r\n"
 L"sortdir=SEMICOLON\r\n"
 L"filter=F\r\n"
+L"keywordsets=K\r\n"
 L"grid=G\r\n"
 L"infopos=Z\r\n"
 L"help=H\r\n"
@@ -547,6 +659,21 @@ static void loadConfig() {
     bindKey(iniGet(L"keys", L"help", L"H"), A_HELP);
     bindKey(iniGet(L"keys", L"prefs", L"SHIFT+P"), A_PREFS);
     bindKey(iniGet(L"keys", L"reject", L"X"), A_REJECT);
+    {   // new-in-v5 action: the K default must not steal a key an existing ini
+        // already gave to another action — apply it only if K is still free
+        std::wstring kk = iniGet(L"keys", L"keywordsets", L"\x01");
+        if (kk != L"\x01") bindKey(kk, A_KEYWORDS);
+        else if (!g_keymap.count('K')) g_keymap['K'] = A_KEYWORDS;
+    }
+    for (int i = 0; i < 10; i++) {   // [keywords] setNkey / setNwords (docs/keyword-sets.md)
+        wchar_t kk[16], kw[16];
+        swprintf(kk, 16, L"set%dkey", i + 1);
+        swprintf(kw, 16, L"set%dwords", i + 1);
+        g_kwSlots[i].key = parseKeyName(iniGet(L"keywords", kk, L""));
+        wchar_t wbuf[1024];   // keyword lists can outgrow iniGet's 512 buffer
+        GetPrivateProfileStringW(L"keywords", kw, L"", wbuf, 1024, g_iniPath.c_str());
+        g_kwSlots[i].words = wbuf;
+    }
     g_infoTop = iniGet(L"state", L"infotop", L"0") == L"1";
     g_sessionInFolder = iniGet(L"options", L"sessioninfolder", L"1") != L"0";
     g_pairRawJpg = iniGet(L"options", L"pairrawjpg", L"1") != L"0";
@@ -1842,21 +1969,25 @@ static void paintFilterPanel(HDC mem) {
     DeleteObject(small);
 }
 
-static std::wstring vkName(UINT vk) {
+// display form ("Ctrl+Alt+Shift+Win+X"); forIni emits the canonical cross-
+// platform ini tokens in canonical order (CTRL+ALT+SHIFT+CMD+X) per
+// docs/key-bindings.md — parseKeyName round-trips both forms.
+static std::wstring vkName(UINT vk, bool forIni = false) {
     std::wstring pre;
-    if (vk & KM_SHIFT) { pre = L"Shift+"; vk &= ~KM_SHIFT; }
+    if (vk & KM_CTRL)  pre += forIni ? L"CTRL+"  : L"Ctrl+";
+    if (vk & KM_ALT)   pre += forIni ? L"ALT+"   : L"Alt+";
+    if (vk & KM_SHIFT) pre += forIni ? L"SHIFT+" : L"Shift+";
+    if (vk & KM_WIN)   pre += forIni ? L"CMD+"   : L"Win+";
+    vk &= 0xFFFF;
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return pre + std::wstring(1, (wchar_t)vk);
     for (auto& k : kKeyNames) if (k.vk == vk) return pre + k.name;
     return L"?";
 }
 
-// shift-aware lookup: prefer Shift+key binding when Shift is held
+// all held modifiers are part of the key identity (docs/key-bindings.md):
+// Shift+X and X are different bindings, Ctrl+Y != Y
 static Action actionForKey(UINT vk) {
-    if (GetKeyState(VK_SHIFT) & 0x8000) {
-        auto it = g_keymap.find(vk | KM_SHIFT);
-        if (it != g_keymap.end()) return it->second;
-    }
-    auto it = g_keymap.find(vk);
+    auto it = g_keymap.find(vk | heldMods());
     return it != g_keymap.end() ? it->second : A_NONE;
 }
 
@@ -1873,6 +2004,7 @@ static const ActRow kActRows[] = {
     { A_LABEL_PURPLE, L"Purple label", L"labelpurple" },
     { A_ZOOM, L"Zoom 100% / back", L"zoom" },
     { A_GRID, L"Grid \x2194 fullscreen", L"grid" }, { A_FILTER, L"Filter", L"filter" },
+    { A_KEYWORDS, L"Keyword sets", L"keywordsets" },
     { A_SORTNEXT, L"Next sort mode", L"sortnext" }, { A_SORTPREV, L"Prev sort mode", L"sortprev" },
     { A_SORTDIR, L"Sort direction", L"sortdir" },
     { A_TOGGLE_INFO, L"Info bar on/off", L"toggleinfo" }, { A_INFOPOS, L"Info bar top/bottom", L"infopos" },
@@ -1881,13 +2013,18 @@ static const ActRow kActRows[] = {
 };
 static const int kNumActRows = (int)(sizeof(kActRows) / sizeof(kActRows[0]));
 
-static std::wstring keysOfAction(Action a) {
+static std::wstring keysOfAction(Action a, bool forIni = false) {
     std::wstring keys;
     for (auto& kv : g_keymap) {
         if (kv.second != a) continue;
-        if (kv.first >= VK_NUMPAD0 && kv.first <= VK_NUMPAD9) continue;
-        if (!keys.empty()) keys += L", ";
-        keys += vkName(kv.first);
+        if (kv.first >= VK_NUMPAD0 && kv.first <= VK_NUMPAD9) {
+            // hide only true auto-twins (digit bound to the same action) —
+            // an explicitly captured numpad key must survive serialization
+            auto d = g_keymap.find('0' + (kv.first - VK_NUMPAD0));
+            if (d != g_keymap.end() && d->second == a) continue;
+        }
+        if (!keys.empty()) keys += forIni ? L"," : L", ";
+        keys += vkName(kv.first, forIni);
     }
     return keys;
 }
@@ -1895,12 +2032,48 @@ static std::wstring keysOfAction(Action a) {
 static void writeKeysToIni(Action a) {
     for (auto& r : kActRows) {
         if (r.a != a) continue;
-        WritePrivateProfileStringW(L"keys", r.iniName, keysOfAction(a).c_str(), g_iniPath.c_str());
+        WritePrivateProfileStringW(L"keys", r.iniName, keysOfAction(a, true).c_str(), g_iniPath.c_str());
         return;
     }
 }
 
+static void writeKwSlotToIni(int i) {
+    wchar_t kk[16], kw[16];
+    swprintf(kk, 16, L"set%dkey", i + 1);
+    swprintf(kw, 16, L"set%dwords", i + 1);
+    WritePrivateProfileStringW(L"keywords", kk,
+        g_kwSlots[i].key ? vkName(g_kwSlots[i].key, true).c_str() : L"", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"keywords", kw, g_kwSlots[i].words.c_str(), g_iniPath.c_str());
+}
+
+// keyword slot dispatch: fires only when the keymap lookup missed (actions win).
+// An unmodified numpad digit also matches a slot bound to the plain digit,
+// mirroring how action bindings twin digits.
+static int kwSlotForKey(UINT key) {
+    for (int i = 0; i < 10; i++)
+        if (g_kwSlots[i].key && g_kwSlots[i].key == key && !g_kwSlots[i].words.empty())
+            return i;
+    if (key >= VK_NUMPAD0 && key <= VK_NUMPAD9)
+        return kwSlotForKey('0' + (key - VK_NUMPAD0));
+    return -1;
+}
+
+// who owns this key? e.g. "“Next image”" or "keyword set 3"; empty = free.
+// Single source for the conflict notices (docs/keyword-sets.md, key-conflict rules)
+static std::wstring keyUsedBy(UINT key, Action ignoreAction, int ignoreKwSlot) {
+    auto it = g_keymap.find(key);
+    if (it != g_keymap.end() && it->second != ignoreAction)
+        for (auto& r : kActRows)
+            if (r.a == it->second) return std::wstring(L"\x201C") + r.label + L"\x201D";
+    for (int i = 0; i < 10; i++)
+        if (i != ignoreKwSlot && key && g_kwSlots[i].key == key)
+            return L"keyword set " + std::to_wstring(i + 1);
+    return L"";
+}
+
 static void rebindAction(Action a, UINT vk) {
+    std::wstring took = keyUsedBy(vk, a, -1);
+    g_prefsMsg = took.empty() ? L"" : L"Reassigned that key from " + took + L".";
     Action stolen = A_NONE;
     auto owner = g_keymap.find(vk);
     if (owner != g_keymap.end() && owner->second != a) stolen = owner->second;
@@ -1911,9 +2084,155 @@ static void rebindAction(Action a, UINT vk) {
         if (killA || killVk) it2 = g_keymap.erase(it2); else ++it2;
     }
     g_keymap[vk] = a;
-    if (vk >= '0' && vk <= '9') g_keymap[VK_NUMPAD0 + (vk - '0')] = a;   // unshifted digits only
+    UINT twin = (vk >= '0' && vk <= '9') ? (UINT)(VK_NUMPAD0 + vk - '0') : 0;
+    if (twin) g_keymap[twin] = a;        // unshifted digits bind their numpad twin
+    for (int i = 0; i < 10; i++)         // a keyword slot holding this key (or the
+        if (g_kwSlots[i].key == vk ||    // claimed twin) would go silently dead
+            (twin && g_kwSlots[i].key == twin)) {   // (actions win): unbind + notice
+            if (g_prefsMsg.empty())
+                g_prefsMsg = L"Reassigned that key from keyword set " + std::to_wstring(i + 1) + L".";
+            g_kwSlots[i].key = 0;
+            writeKwSlotToIni(i);
+        }
     writeKeysToIni(a);
     if (stolen != A_NONE) writeKeysToIni(stolen);
+}
+
+// ------------------------------------------------------- keyword sets editor
+struct KwChip { RECT rc; int kind; int slot; };  // 0=key chip 1=unbind 2=words 3=close
+static std::vector<KwChip> g_kwChips;
+static RECT g_kwRc{};
+static WNDPROC g_kwEditOldProc = nullptr;
+
+static void kwEndEdit(bool commit) {
+    HWND e = g_kwEdit;
+    if (!e) return;
+    g_kwEdit = nullptr;                    // clear first: EN_KILLFOCUS re-enters
+    if (commit && g_kwEditSlot >= 0) {
+        wchar_t buf[1024];
+        GetWindowTextW(e, buf, 1024);
+        g_kwSlots[g_kwEditSlot].words = buf;
+        writeKwSlotToIni(g_kwEditSlot);
+    }
+    g_kwEditSlot = -1;
+    DestroyWindow(e);
+    SetFocus(g_hwnd);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK kwEditSubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == VK_RETURN) { kwEndEdit(true); return 0; }
+    if (m == WM_KEYDOWN && w == VK_ESCAPE) { kwEndEdit(false); return 0; }
+    if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE)) return 0;
+    return CallWindowProcW(g_kwEditOldProc, h, m, w, l);
+}
+
+static void kwStartEdit(int slot, const RECT& rc) {
+    kwEndEdit(true);
+    g_kwEditSlot = slot;
+    g_kwEdit = CreateWindowExW(0, L"EDIT", g_kwSlots[slot].words.c_str(),
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        rc.left + 2, rc.top + 2, rc.right - rc.left - 4, rc.bottom - rc.top - 4,
+        g_hwnd, (HMENU)(INT_PTR)101, GetModuleHandleW(nullptr), nullptr);
+    if (g_kwEdit) {
+        g_kwEditOldProc = (WNDPROC)SetWindowLongPtrW(g_kwEdit, GWLP_WNDPROC, (LONG_PTR)kwEditSubProc);
+        static HFONT s_kwFont = CreateFontW(-MulDiv(15, g_dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH, L"Segoe UI");
+        SendMessageW(g_kwEdit, WM_SETFONT, (WPARAM)s_kwFont, TRUE);
+        SetFocus(g_kwEdit);
+        SendMessageW(g_kwEdit, EM_SETSEL, 0, -1);
+    }
+}
+
+static void closeKeywords() {
+    kwEndEdit(true);
+    g_kwOpen = false;
+    g_kwCapture = -1;
+    g_kwMsg.clear();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void paintKeywords(HDC mem) {
+    int rowH = MulDiv(34, g_dpi, 96);
+    int pad = MulDiv(20, g_dpi, 96);
+    int w = MulDiv(700, g_dpi, 96);
+    int hgt = pad * 2 + rowH * 13;
+    RECT panel{ (g_scrW - w) / 2, (g_scrH - hgt) / 2, (g_scrW + w) / 2, (g_scrH + hgt) / 2 };
+    g_kwRc = panel;
+    g_kwChips.clear();
+    HBRUSH bg = CreateSolidBrush(RGB(24, 24, 26));
+    FillRect(mem, &panel, bg);
+    DeleteObject(bg);
+    HBRUSH fr = CreateSolidBrush(RGB(110, 110, 115));
+    FrameRect(mem, &panel, fr);
+    DeleteObject(fr);
+    HFONT small = CreateFontW(-MulDiv(15, g_dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                              DEFAULT_PITCH, L"Segoe UI");
+    HFONT oldF = (HFONT)SelectObject(mem, small);
+    SetTextColor(mem, RGB(235, 235, 235));
+    RECT tr{ panel.left + pad, panel.top + MulDiv(10, g_dpi, 96), panel.right - pad,
+             panel.top + MulDiv(10, g_dpi, 96) + rowH };
+    DrawTextW(mem, L"Keyword sets \x2014 press a set's key while culling to toggle its keywords",
+              -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    int chipH = MulDiv(26, g_dpi, 96);
+    int y = tr.bottom + MulDiv(6, g_dpi, 96);
+    for (int i = 0; i < 10; i++) {
+        int yy = y + i * rowH;
+        wchar_t lab[16];
+        swprintf(lab, 16, L"Set %d", i + 1);
+        SetTextColor(mem, RGB(180, 180, 180));
+        RECT lr{ panel.left + pad, yy, panel.left + pad + MulDiv(52, g_dpi, 96), yy + chipH };
+        DrawTextW(mem, lab, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        // key chip
+        RECT kc{ lr.right + MulDiv(6, g_dpi, 96), yy, lr.right + MulDiv(6 + 130, g_dpi, 96), yy + chipH };
+        std::wstring kn = g_kwCapture == i ? L"press key\x2026"
+                        : g_kwSlots[i].key ? vkName(g_kwSlots[i].key) : L"\x2014";
+        drawBtn(mem, kc, kn.c_str(), g_kwCapture == i);
+        g_kwChips.push_back({ kc, 0, i });
+        // unbind
+        RECT xc{ kc.right + MulDiv(4, g_dpi, 96), yy, kc.right + MulDiv(4 + 26, g_dpi, 96), yy + chipH };
+        if (g_kwSlots[i].key) {
+            drawBtn(mem, xc, L"\x2715", false);
+            g_kwChips.push_back({ xc, 1, i });
+        }
+        // words field
+        RECT wf{ xc.right + MulDiv(10, g_dpi, 96), yy, panel.right - pad, yy + chipH };
+        HBRUSH fb = CreateSolidBrush(RGB(60, 60, 64));
+        FrameRect(mem, &wf, fb);
+        DeleteObject(fb);
+        if (g_kwEditSlot != i) {   // when editing, the EDIT control draws itself
+            RECT wt{ wf.left + MulDiv(6, g_dpi, 96), yy, wf.right - MulDiv(4, g_dpi, 96), yy + chipH };
+            if (g_kwSlots[i].words.empty()) {
+                SetTextColor(mem, RGB(120, 120, 120));
+                DrawTextW(mem, L"click to add keywords\x2026", -1, &wt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                SetTextColor(mem, RGB(225, 225, 225));
+                DrawTextW(mem, g_kwSlots[i].words.c_str(), -1, &wt,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+        }
+        g_kwChips.push_back({ wf, 2, i });
+    }
+
+    int fy = y + 10 * rowH + MulDiv(6, g_dpi, 96);
+    RECT fr2{ panel.left + pad, fy, panel.right - pad - MulDiv(100, g_dpi, 96), fy + chipH };
+    if (!g_kwMsg.empty()) {
+        SetTextColor(mem, RGB(255, 200, 40));
+        DrawTextW(mem, g_kwMsg.c_str(), -1, &fr2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    } else {
+        SetTextColor(mem, RGB(150, 150, 150));
+        DrawTextW(mem, L"Click a key chip, then press the new key \x00B7 comma-separate keywords \x00B7"
+                       L" saved instantly, follows you across shoots",
+                  -1, &fr2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    RECT xb{ panel.right - pad - MulDiv(90, g_dpi, 96), fy, panel.right - pad, fy + chipH };
+    drawBtn(mem, xb, L"Close (Esc)", false);
+    g_kwChips.push_back({ xb, 3, 0 });
+    SelectObject(mem, oldF);
+    DeleteObject(small);
 }
 
 static void paintHelp(HDC mem) {
@@ -1922,7 +2241,7 @@ static void paintHelp(HDC mem) {
     int rowH = MulDiv(26, g_dpi, 96);
     int colW = MulDiv(330, g_dpi, 96);
     int pad = MulDiv(20, g_dpi, 96);
-    int w = colW * 2 + pad * 2, hgt = perCol * rowH + pad * 2 + rowH * 3;
+    int w = colW * 2 + pad * 2, hgt = perCol * rowH + pad * 2 + rowH * 4;
     RECT panel{ (g_scrW - w) / 2, (g_scrH - hgt) / 2, (g_scrW + w) / 2, (g_scrH + hgt) / 2 };
     HBRUSH bg = CreateSolidBrush(RGB(24, 24, 26));
     FillRect(mem, &panel, bg);
@@ -1943,13 +2262,7 @@ static void paintHelp(HDC mem) {
         int col = i / perCol, rw = i % perCol;
         int x = panel.left + pad + col * colW;
         int y = panel.top + pad + rowH + rw * rowH;
-        std::wstring keys;
-        for (auto& kv : g_keymap) {
-            if (kv.second != kActRows[i].a) continue;
-            if (kv.first >= VK_NUMPAD0 && kv.first <= VK_NUMPAD9) continue;  // auto twins
-            if (!keys.empty()) keys += L", ";
-            keys += vkName(kv.first);
-        }
+        std::wstring keys = keysOfAction(kActRows[i].a);
         if (keys.empty()) keys = L"\x2014";
         SetTextColor(mem, RGB(255, 200, 40));
         RECT kr{ x, y, x + MulDiv(110, g_dpi, 96), y + rowH };
@@ -1959,10 +2272,15 @@ static void paintHelp(HDC mem) {
         DrawTextW(mem, kActRows[i].label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
     SetTextColor(mem, RGB(150, 150, 150));
-    RECT fn{ panel.left + pad, panel.bottom - pad - rowH * 2, panel.right - pad, panel.bottom - pad };
+    RECT fn{ panel.left + pad, panel.bottom - pad - rowH * 3, panel.right - pad, panel.bottom - pad - rowH };
     DrawTextW(mem, L"Reject (\x2716) = xmp:Rating \"-1\" \x2014 Bridge/Photo Mechanic only;\n"
                    L"Lightroom ignores XMP rejects (its flags are catalog-only)",
               -1, &fn, DT_CENTER | DT_WORDBREAK);
+    SetTextColor(mem, RGB(255, 200, 40));
+    RECT dn{ panel.left + pad, panel.bottom - pad - rowH, panel.right - pad, panel.bottom - pad };
+    DrawTextW(mem, L"iRate is donationware \x2014 if it saves your evenings:"
+                   L" buymeacoffee.com/lorasandlenses",
+              -1, &dn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 // prefs GUI: chips rebuilt each paint. kind 0=advance 1=ext 2=rebind 3=close 4=showinfo 5=barpos
@@ -2071,11 +2389,16 @@ static void paintPrefs(HDC mem) {
     }
     y += rowH;
 
-    SetTextColor(mem, RGB(180, 180, 180));
     RECT kh{ panel.left + pad, y, panel.right - pad, y + rowH };
-    DrawTextW(mem, g_prefsCapture >= 0 ? L"Press the new key\x2026  (Esc cancels)"
-                                       : L"Keys \x2014 click an action, then press its new key:",
-              -1, &kh, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (g_prefsCapture < 0 && !g_prefsMsg.empty()) {
+        SetTextColor(mem, RGB(255, 200, 40));   // conflict notice, gold
+        DrawTextW(mem, g_prefsMsg.c_str(), -1, &kh, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    } else {
+        SetTextColor(mem, RGB(180, 180, 180));
+        DrawTextW(mem, g_prefsCapture >= 0 ? L"Press the new key\x2026  (Esc cancels)"
+                                           : L"Keys \x2014 click an action, then press its new key:",
+                  -1, &kh, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
     y += rowH + MulDiv(2, g_dpi, 96);
 
     for (int i = 0; i < kNumActRows; i++) {
@@ -2252,6 +2575,24 @@ static void paint(HDC dc) {
                 if (!lens.empty()) extra += (extra.empty() ? L"" : L"   ") + lens;
                 if (!extra.empty()) add(L"|   " + extra);
             }
+            {   // keywords: {kw1, kw2, kw3, kw4, …} — first 4 then ellipsis
+                std::vector<std::string> kwc;
+                {
+                    std::lock_guard<std::mutex> lk(g_itemsMx);
+                    kwc = item.keywords;
+                }
+                if (!kwc.empty()) {
+                    std::wstring ks = L"{";
+                    int shown = 0;
+                    for (auto& k : kwc) {
+                        if (shown == 4) { ks += L", \x2026"; break; }
+                        if (shown++) ks += L", ";
+                        ks += utf8ToWide(k);
+                    }
+                    ks += L"}";
+                    add(ks);
+                }
+            }
             const wchar_t* sortNames[3] = { L"Name", L"Date", L"Size" };
             wchar_t cnt[64];
             if (g_filter.active())
@@ -2292,6 +2633,7 @@ static void paint(HDC dc) {
 
     if (g_filterOpen && !g_scanning) paintFilterPanel(mem);
     if (g_prefsOpen && !g_scanning) paintPrefs(mem);
+    if (g_kwOpen && !g_scanning) paintKeywords(mem);
     if (g_helpOpen) paintHelp(mem);
 
     SelectObject(mem, oldFont);
@@ -2312,7 +2654,20 @@ static void doAction(Action a) {
     case A_PREFS:
         g_prefsOpen = !g_prefsOpen;
         g_prefsCapture = -1;
+        g_prefsMsg.clear();
         if (g_prefsOpen && g_filterOpen) closeFilterPanel();
+        if (g_prefsOpen && g_kwOpen) closeKeywords();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return;
+    case A_KEYWORDS:
+        if (g_scanning) return;
+        if (g_kwOpen) { closeKeywords(); return; }
+        g_kwOpen = true;
+        g_kwCapture = -1;
+        g_kwMsg.clear();
+        if (g_filterOpen) closeFilterPanel();
+        g_prefsOpen = false;
+        g_prefsCapture = -1;
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return;
     case A_FILTER:
@@ -2331,6 +2686,7 @@ static void doAction(Action a) {
         ShowScrollBar(g_hwnd, SB_VERT, g_gridMode);
         if (!g_gridMode) {
             if (g_filterOpen) closeFilterPanel();
+            if (g_kwOpen) closeKeywords();
             g_prefsOpen = false;
             g_prefsCapture = -1;
         }
@@ -2430,13 +2786,62 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         EndPaint(h, &ps);
         return 0; }
     case WM_ERASEBKGND: return 1;
+    case WM_SYSCHAR:
+        return 0;   // no menu: suppress the mnemonic beep for Alt+key presses
+    case WM_SYSKEYDOWN: {
+        // Alt+combos arrive here; handle keys we own, let everything else
+        // reach DefWindowProc. Alt+F4 always quits — even during key capture.
+        if ((UINT)w == VK_F4) break;
+        bool capturing = (g_prefsOpen && g_prefsCapture >= 0) ||
+                         (g_kwOpen && g_kwCapture >= 0);
+        if (!capturing && actionForKey((UINT)w) == A_NONE &&
+            kwSlotForKey((UINT)w | heldMods()) < 0)
+            break;
+    }
+    // fall through: treat like a normal keydown
     case WM_KEYDOWN: {
+        if (g_kwOpen) {
+            if (g_kwEdit) return 0;              // words field owns the keyboard
+            UINT vk = (UINT)w;
+            if (g_kwCapture >= 0) {
+                if (vk == VK_ESCAPE) { g_kwCapture = -1; g_kwMsg.clear(); InvalidateRect(h, nullptr, FALSE); return 0; }
+                if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+                    vk == VK_LWIN || vk == VK_RWIN) return 0;
+                UINT cap = vk | heldMods();
+                if (vkName(cap) == L"?") return 0;
+                UINT base = cap & 0xFFFF;
+                if (base == VK_RETURN || base == VK_UP || base == VK_DOWN ||
+                    base == VK_PRIOR || base == VK_NEXT) {
+                    // grid mode hardcodes these before slot dispatch, so the
+                    // set would silently never fire there
+                    g_kwMsg = L"That key navigates the grid \x2014 pick another.";
+                } else if (g_keymap.count(cap)) { // app controls win at dispatch: refuse
+                    g_kwMsg = L"That key runs an app control \x2014 pick another"
+                              L" (or rebind that control in Preferences first).";
+                } else {
+                    g_kwMsg.clear();
+                    for (int i = 0; i < 10; i++)
+                        if (i != g_kwCapture && g_kwSlots[i].key == cap) {
+                            g_kwSlots[i].key = 0;    // steal between slots
+                            writeKwSlotToIni(i);
+                            g_kwMsg = L"Moved that key here from Set " + std::to_wstring(i + 1) + L".";
+                        }
+                    g_kwSlots[g_kwCapture].key = cap;
+                    writeKwSlotToIni(g_kwCapture);
+                    g_kwCapture = -1;
+                }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if (vk == VK_ESCAPE || actionForKey(vk) == A_KEYWORDS) closeKeywords();
+            return 0;
+        }
         if (g_prefsOpen) {
             if (g_prefsCapture >= 0) {
                 if (w == VK_ESCAPE) { g_prefsCapture = -1; InvalidateRect(h, nullptr, FALSE); return 0; }
-                if (w == VK_SHIFT || w == VK_CONTROL || w == VK_MENU) return 0;
-                UINT cap = (UINT)w;
-                if (GetKeyState(VK_SHIFT) & 0x8000) cap |= KM_SHIFT;
+                if (w == VK_SHIFT || w == VK_CONTROL || w == VK_MENU ||
+                    w == VK_LWIN || w == VK_RWIN) return 0;
+                UINT cap = (UINT)w | heldMods();
                 if (vkName(cap) != L"?") {
                     rebindAction((Action)g_prefsCapture, cap);
                     g_prefsCapture = -1;
@@ -2493,6 +2898,17 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
             }
             doAction(act);
+        } else if (!g_scanning && !(l & (1 << 30))) {   // first press only: toggles
+            // aren't idempotent, so auto-repeat must never fire them.
+            // Keyword slots fire only when the keymap missed (actions win).
+            int slot = kwSlotForKey((UINT)w | heldMods());
+            int itemIdx = curItem();
+            if (slot >= 0 && itemIdx >= 0) {
+                auto words = splitKeywords(g_kwSlots[slot].words);
+                if (!words.empty())
+                    queueKeywordToggle(itemIdx, g_items[itemIdx].path, words);
+                // no auto-advance: several sets often apply to one image
+            }
         }
         return 0; }
     case WM_COMMAND:
@@ -2502,6 +2918,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_filter.text = buf;
             filterChanged();
         }
+        if (LOWORD(w) == 101 && HIWORD(w) == EN_KILLFOCUS) kwEndEdit(true);
         return 0;
     case WM_VSCROLL: {
         if (!g_gridMode) return 0;
@@ -2533,6 +2950,39 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: {
         int mx = (int)(short)LOWORD(l), my = (int)(short)HIWORD(l);
         POINT pt{ mx, my };
+        if (g_kwOpen) {
+            if (PtInRect(&g_kwRc, pt)) {
+                for (auto& ch : g_kwChips) {
+                    if (!PtInRect(&ch.rc, pt)) continue;
+                    switch (ch.kind) {
+                    case 0:                       // key chip: arm capture
+                        kwEndEdit(true);
+                        g_kwCapture = ch.slot;
+                        g_kwMsg.clear();
+                        break;
+                    case 1:                       // unbind
+                        kwEndEdit(true);
+                        g_kwSlots[ch.slot].key = 0;
+                        writeKwSlotToIni(ch.slot);
+                        if (g_kwCapture == ch.slot) g_kwCapture = -1;
+                        break;
+                    case 2:                       // words field: start typing
+                        g_kwCapture = -1;
+                        kwStartEdit(ch.slot, ch.rc);
+                        break;
+                    case 3:
+                        closeKeywords();
+                        return 0;
+                    }
+                    InvalidateRect(h, nullptr, FALSE);
+                    return 0;
+                }
+                kwEndEdit(true);                  // click elsewhere in panel ends editing
+                return 0;
+            }
+            closeKeywords();                      // click outside closes (like prefs)
+            return 0;
+        }
         if (g_prefsOpen) {
             if (PtInRect(&g_prefsRc, pt)) {
                 for (auto& ch : g_pchips) {
@@ -2556,7 +3006,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         clearThumbs();
                         rescanFolder();
                         break; }
-                    case 2: g_prefsCapture = ch.val; break;
+                    case 2: g_prefsCapture = ch.val; g_prefsMsg.clear(); break;
                     case 3: g_prefsOpen = false; g_prefsCapture = -1; break;
                     case 4:
                         g_showInfo = !g_showInfo;

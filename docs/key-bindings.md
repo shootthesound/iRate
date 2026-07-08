@@ -54,11 +54,13 @@ strips the prefixes in a loop; `specForEvent` reads `NSEventModifierFlag{Shift,
 Control,Option,Command}`; `actionForEvent` now does a full `KeySpec ==` compare
 (all modifiers); `iniTokenForKey` and `keyDisplayName` emit the prefixes/symbols.
 
-**Windows port:** the keymap key is a `UINT` with `KM_SHIFT = 0x20000`. Add
-`KM_CTRL`, `KM_ALT`, `KM_WIN` bit flags (pick free high bits), OR the held
-modifiers into the lookup key, and teach `parseKeyName` / `vkName` / the rebind
-capture (`GetKeyState(VK_CONTROL|VK_MENU|VK_LWIN)`) to read/emit them. Keep the
-canonical write order and the same ini token spelling above.
+**Windows port (DONE 2026-07):** the keymap key is a `UINT` with `KM_SHIFT =
+0x20000`, plus `KM_CTRL = 0x40000`, `KM_ALT = 0x80000`, `KM_WIN = 0x100000`.
+`heldMods()` ORs the held modifiers into the lookup key; `parseKeyName` strips
+prefixes in any order; `vkName(vk, forIni)` emits display form
+(`Ctrl+Alt+Shift+Win+X`) or canonical ini tokens (`CTRL+ALT+SHIFT+CMD+X`).
+Alt-combos arrive via `WM_SYSKEYDOWN`, which falls through to the shared handler
+only for keys the app owns (so Alt+F4 etc. still reach DefWindowProc).
 
 ### Caveats
 
