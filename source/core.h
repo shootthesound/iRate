@@ -559,3 +559,90 @@ inline void xmpParse(const std::string& s, int& rating, int& label) {
             if (v == kLabelNames[i]) { label = i; break; }
     }
 }
+
+// ------------------------------------------------- keywords (dc:subject bag)
+// Lightroom/Bridge keywords live in the sidecar as an rdf:Bag of rdf:li under
+// dc:subject, element-form inside rdf:Description:
+//   <rdf:Description ... xmlns:dc="http://purl.org/dc/elements/1.1/">
+//     <dc:subject><rdf:Bag><rdf:li>ceremony</rdf:li>...</rdf:Bag></dc:subject>
+//   </rdf:Description>
+// Same string-patching philosophy as rating/label: the WHOLE dc:subject block is
+// replaced on write (callers pass the image's full keyword list each time), all
+// other sidecar content (crs:* develop settings etc.) is preserved byte-for-byte.
+// Shared by both shells — keep this section platform-clean.
+
+inline std::string xmlEscape(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    for (char c : s) switch (c) {
+        case '&': o += "&amp;"; break;  case '<': o += "&lt;"; break;
+        case '>': o += "&gt;"; break;   case '"': o += "&quot;"; break;
+        default:  o += c;
+    }
+    return o;
+}
+inline std::string xmlUnescape(std::string s) {
+    auto rep = [&](const char* a, const char* b) {
+        size_t p = 0, la = strlen(a), lb = strlen(b);
+        while ((p = s.find(a, p)) != std::string::npos) { s.replace(p, la, b); p += lb; }
+    };
+    rep("&lt;", "<"); rep("&gt;", ">"); rep("&quot;", "\""); rep("&#39;", "'");
+    rep("&amp;", "&");   // must be last (avoids double-decoding &amp;lt;)
+    return s;
+}
+
+// Read the image's keywords from a sidecar. Empty vector = none / no dc:subject.
+inline std::vector<std::string> xmpGetKeywords(const std::string& s) {
+    std::vector<std::string> out;
+    size_t p = s.find("<dc:subject");
+    if (p == std::string::npos) return out;
+    size_t end = s.find("</dc:subject>", p);
+    if (end == std::string::npos) return out;
+    size_t pos = p;
+    while (true) {
+        size_t li = s.find("<rdf:li", pos);
+        if (li == std::string::npos || li > end) break;
+        size_t gt = s.find('>', li);
+        if (gt == std::string::npos || gt > end) break;
+        size_t close = s.find("</rdf:li>", gt);
+        if (close == std::string::npos || close > end) break;
+        std::string v = xmlUnescape(s.substr(gt + 1, close - gt - 1));
+        if (!v.empty()) out.push_back(v);
+        pos = close + 9;
+    }
+    return out;
+}
+
+// Write the FULL keyword list into a sidecar (replaces any existing dc:subject;
+// an empty list removes it). Creates a fresh sidecar (rating 0, no label) when
+// existing is empty/garbage — call after xmpApply if you're also writing those.
+inline std::string xmpApplyKeywords(const std::string& existing,
+                                    const std::vector<std::string>& kws) {
+    std::string s = existing;
+    if (s.empty() || s.find("<rdf:Description") == std::string::npos)
+        s = xmpFresh(0, 0);
+    // drop any existing dc:subject block
+    size_t p = s.find("<dc:subject");
+    if (p != std::string::npos) {
+        size_t end = s.find("</dc:subject>", p);
+        if (end != std::string::npos) s.erase(p, end + 13 - p);
+        else { size_t sc = s.find("/>", p); if (sc != std::string::npos) s.erase(p, sc + 2 - p); }
+    }
+    if (kws.empty()) return s;
+    std::string bag = "<dc:subject><rdf:Bag>";
+    for (auto& k : kws) bag += "<rdf:li>" + xmlEscape(k) + "</rdf:li>";
+    bag += "</rdf:Bag></dc:subject>";
+    // ensure the dc namespace is declared on rdf:Description
+    size_t d = s.find("<rdf:Description");
+    if (d == std::string::npos) return s;
+    if (s.find("xmlns:dc") == std::string::npos) {
+        s.insert(d + strlen("<rdf:Description"),
+                 " xmlns:dc=\"http://purl.org/dc/elements/1.1/\"");
+        d = s.find("<rdf:Description");
+    }
+    // insert the bag as element content (converting a self-closing tag if needed)
+    size_t gt = s.find('>', d);
+    if (gt == std::string::npos) return s;
+    if (s[gt - 1] == '/') s.replace(gt - 1, 2, ">" + bag + "</rdf:Description>");
+    else                  s.insert(gt + 1, bag);
+    return s;
+}

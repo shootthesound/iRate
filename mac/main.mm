@@ -59,6 +59,7 @@ struct Item {
     int rating = -2;   // -2 = sidecar not read yet, -1 = rejected, 0..5 stars
     int label = -1;
     bool jpgTwin = false;   // a same-name JPG sits beside this raw
+    std::vector<std::string> keywords;   // dc:subject from the sidecar
 };
 
 // ------------------------------------------------------------------ actions
@@ -68,7 +69,7 @@ enum Action {
     A_RATE0, A_RATE1, A_RATE2, A_RATE3, A_RATE4, A_RATE5,
     A_LABEL_RED, A_LABEL_YELLOW, A_LABEL_GREEN, A_LABEL_BLUE, A_LABEL_PURPLE,
     A_REJECT, A_SORTNEXT, A_SORTPREV, A_SORTDIR, A_GRID, A_ZOOM, A_FILTER,
-    A_TOGGLE_INFO, A_INFOPOS, A_HELP, A_PREFS, A_QUIT,
+    A_KEYWORDS, A_TOGGLE_INFO, A_INFOPOS, A_HELP, A_PREFS, A_QUIT,
 };
 
 // Single source of truth for keybinds: drives the loaded keymap AND the help
@@ -98,6 +99,7 @@ static const ActRow kActRows[] = {
     { A_GRID,        "Grid / fullscreen", "grid",        "G" },
     { A_ZOOM,        "Zoom 100% / back",  "zoom",        "SLASH" },
     { A_FILTER,      "Filter panel",      "filter",      "F" },
+    { A_KEYWORDS,    "Keyword sets",      "keywordsets", "K" },
     { A_TOGGLE_INFO, "Info bar on/off",   "toggleinfo",  "I" },
     { A_INFOPOS,     "Info bar top/bottom","infopos",    "Z" },
     { A_HELP,        "Shortcut help",     "help",        "H" },
@@ -121,6 +123,7 @@ static bool g_infoTop = false;              // info bar at top instead of bottom
 static bool g_helpOpen = false;             // shortcut overlay visible
 static bool g_prefsOpen = false;            // preferences / rebind overlay visible
 static int g_prefsCaptureAction = -1;       // Action being rebound (mouse-picked), or -1
+static NSString* g_prefsMsg = nil;          // transient rebind conflict message
 static int g_advanceMode = 0;               // 0=capslock 1=always 2=never
 static int g_sortType = 0;                  // 0=name 1=date 2=size
 static bool g_sortDesc = false;
@@ -200,9 +203,11 @@ static bool hasWantedExt(const std::string& name) {
 // A key is identified either by macOS hardware keyCode (arrows, Home, Esc, …) or
 // by its character (letters / digits / punctuation), plus a Shift flag. Named
 // specials round-trip through this small table, mirroring the Win32 parseKeyName.
-struct KeySpec { int keyCode = -1; unichar ch = 0; bool shift = false;
+struct KeySpec { int keyCode = -1; unichar ch = 0;
+    bool shift = false, ctrl = false, alt = false, cmd = false;  // alt = Option
     bool operator==(const KeySpec& o) const {
-        return keyCode == o.keyCode && ch == o.ch && shift == o.shift; } };
+        return keyCode == o.keyCode && ch == o.ch && shift == o.shift
+            && ctrl == o.ctrl && alt == o.alt && cmd == o.cmd; } };
 struct NamedKey { const char* name; int keyCode; };
 static const NamedKey kNamedKeys[] = {
     {"LEFT",123},{"RIGHT",124},{"DOWN",125},{"UP",126},{"SPACE",49},
@@ -214,6 +219,31 @@ static const NamedKey kNamedKeys[] = {
 };
 static std::vector<std::pair<KeySpec, Action>> g_keymap;
 
+// Keyword sets: APP-LEVEL (saved in the ini, not per folder) slots pairing a key
+// with a comma-separated keyword list. Pressing a slot's key while culling
+// toggles those keywords on the current image (all present -> remove; else add).
+// Written to the sidecar as a dc:subject bag via core.h's xmpApplyKeywords.
+struct KwSlot { KeySpec key; bool bound = false; std::string words; };
+static const int kKwSlots = 10;
+static KwSlot g_kwSlots[kKwSlots];
+static bool g_kwOpen = false;               // keyword-sets editor visible (K)
+static int g_kwCaptureSlot = -1;            // slot waiting for a key press
+static int g_kwEditSlot = -1;               // slot whose words are being typed
+static NSString* g_kwMsg = nil;             // transient editor message
+// Split a slot's text into trimmed keywords (comma or semicolon separated).
+static std::vector<std::string> splitKeywords(const std::string& s) {
+    std::vector<std::string> out; std::string cur;
+    auto flush = [&]() {
+        while (!cur.empty() && isspace((unsigned char)cur.front())) cur.erase(cur.begin());
+        while (!cur.empty() && isspace((unsigned char)cur.back()))  cur.pop_back();
+        if (!cur.empty()) out.push_back(cur);
+        cur.clear();
+    };
+    for (char c : s) { if (c == ',' || c == ';') flush(); else cur += c; }
+    flush();
+    return out;
+}
+
 // Parse one key token ("RIGHT", "SHIFT+P", "/", "1") into a KeySpec (keyCode<0
 // and ch==0 means "unparsed").
 static KeySpec parseKeyToken(std::string s) {
@@ -221,8 +251,20 @@ static KeySpec parseKeyToken(std::string s) {
     // trim + uppercase-compare for names, but keep original for single chars
     while (!s.empty() && isspace((unsigned char)s.front())) s.erase(s.begin());
     while (!s.empty() && isspace((unsigned char)s.back()))  s.pop_back();
+    // strip modifier prefixes in any order: SHIFT+ CTRL+ ALT+/OPT+ CMD+
+    for (;;) {
+        std::string up = s; for (auto& c : up) c = (char)toupper((unsigned char)c);
+        if      (up.rfind("SHIFT+", 0) == 0)   { k.shift = true; s = s.substr(6); }
+        else if (up.rfind("CTRL+", 0) == 0)    { k.ctrl = true;  s = s.substr(5); }
+        else if (up.rfind("CONTROL+", 0) == 0) { k.ctrl = true;  s = s.substr(8); }
+        else if (up.rfind("ALT+", 0) == 0)     { k.alt = true;   s = s.substr(4); }
+        else if (up.rfind("OPT+", 0) == 0)     { k.alt = true;   s = s.substr(4); }
+        else if (up.rfind("OPTION+", 0) == 0)  { k.alt = true;   s = s.substr(7); }
+        else if (up.rfind("CMD+", 0) == 0)     { k.cmd = true;   s = s.substr(4); }
+        else if (up.rfind("COMMAND+", 0) == 0) { k.cmd = true;   s = s.substr(8); }
+        else break;
+    }
     std::string up = s; for (auto& c : up) c = (char)toupper((unsigned char)c);
-    if (up.rfind("SHIFT+", 0) == 0) { k.shift = true; s = s.substr(6); up = up.substr(6); }
     if (s.empty()) return k;
     for (auto& nk : kNamedKeys) if (up == nk.name) { k.keyCode = nk.keyCode; return k; }
     // Punctuation names -> characters (matched by char, so layout-tolerant).
@@ -250,7 +292,11 @@ static void bindKeys(const std::string& list, Action a) {
 // Build the KeySpec that identifies an incoming key event.
 static KeySpec specForEvent(NSEvent* e) {
     KeySpec k;
-    k.shift = (e.modifierFlags & NSEventModifierFlagShift) != 0;
+    NSEventModifierFlags m = e.modifierFlags;
+    k.shift = (m & NSEventModifierFlagShift)   != 0;
+    k.ctrl  = (m & NSEventModifierFlagControl) != 0;
+    k.alt   = (m & NSEventModifierFlagOption)  != 0;
+    k.cmd   = (m & NSEventModifierFlagCommand) != 0;
     int kc = e.keyCode;
     for (auto& nk : kNamedKeys) if (kc == nk.keyCode) { k.keyCode = kc; return k; }
     NSString* chars = [e.charactersIgnoringModifiers lowercaseString];
@@ -259,16 +305,11 @@ static KeySpec specForEvent(NSEvent* e) {
 }
 static Action actionForEvent(NSEvent* e) {
     KeySpec want = specForEvent(e);
-    for (auto& kv : g_keymap) {
-        // Specials match on keyCode+shift; char keys on ch+shift.
-        if (kv.first.keyCode >= 0) { if (kv.first.keyCode == want.keyCode &&
-            kv.first.shift == want.shift) return kv.second; }
-        else if (kv.first.ch && kv.first.ch == want.ch && kv.first.shift == want.shift)
-            return kv.second;
-    }
+    for (auto& kv : g_keymap)               // full match incl. all modifiers
+        if (kv.first == want) return kv.second;
     return A_NONE;
 }
-// Human-readable name for a bound key (for the help overlay).
+// Human-readable name for a bound key (Mac modifier symbols: ⌃⌥⇧⌘).
 static std::string keyDisplayName(const KeySpec& k) {
     std::string s;
     if (k.keyCode >= 0) {
@@ -277,8 +318,12 @@ static std::string keyDisplayName(const KeySpec& k) {
     } else if (k.ch) {
         s = std::string(1, (char)toupper((int)k.ch));
     }
-    if (k.shift) s = "Shift+" + s;
-    return s;
+    std::string mod;
+    if (k.ctrl)  mod += "⌃";   // ⌃
+    if (k.alt)   mod += "⌥";   // ⌥
+    if (k.shift) mod += "⇧";   // ⇧
+    if (k.cmd)   mod += "⌘";   // ⌘
+    return mod + s;
 }
 // Comma-joined list of the keys currently bound to an action.
 static std::string keysOfAction(Action a) {
@@ -338,7 +383,7 @@ static const char* kDefaultIni =
 "rate1=1\nrate2=2\nrate3=3\nrate4=4\nrate5=5\nrate0=0\nreject=X\n"
 "labelred=6\nlabelyellow=7\nlabelgreen=8\nlabelblue=9\nlabelpurple=P\n"
 "sortnext=RBRACKET\nsortprev=LBRACKET\nsortdir=SEMICOLON\n"
-"grid=G\nzoom=SLASH\nfilter=F\ntoggleinfo=I\ninfopos=Z\nhelp=H\nprefs=SHIFT+P\nquit=ESC\n"
+"grid=G\nzoom=SLASH\nfilter=F\nkeywordsets=K\ntoggleinfo=I\ninfopos=Z\nhelp=H\nprefs=SHIFT+P\nquit=ESC\n"
 "[options]\n"
 "; autoadvance after rating: capslock (only when Caps Lock is on), always, never\n"
 "autoadvance=capslock\n"
@@ -381,6 +426,19 @@ static void loadConfig(const std::string& supportDir) {
     if (adv == "always") g_advanceMode = 1;
     else if (adv == "never" || adv == "0") g_advanceMode = 2;
     else g_advanceMode = 0;
+    // keyword sets: [keywords] setNkey= (key token or empty) / setNwords= (comma list)
+    for (int i = 0; i < kKwSlots; i++) {
+        char kk[16], kw[16];
+        snprintf(kk, sizeof kk, "set%dkey", i + 1);
+        snprintf(kw, sizeof kw, "set%dwords", i + 1);
+        g_kwSlots[i].words = iniGet("keywords", kw, "");
+        g_kwSlots[i].bound = false;
+        std::string tok = iniGet("keywords", kk, "");
+        if (!tok.empty()) {
+            KeySpec k = parseKeyToken(tok);
+            if (k.keyCode >= 0 || k.ch) { g_kwSlots[i].key = k; g_kwSlots[i].bound = true; }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- rebind + write
@@ -394,8 +452,12 @@ static std::string iniTokenForKey(const KeySpec& k) {
     } else if (k.ch) {
         s = std::string(1, (char)toupper((int)k.ch));   // letters upper; punctuation as-is
     }
-    if (k.shift) s = "SHIFT+" + s;
-    return s;
+    std::string pre;                                     // canonical order CTRL ALT SHIFT CMD
+    if (k.ctrl)  pre += "CTRL+";
+    if (k.alt)   pre += "ALT+";
+    if (k.shift) pre += "SHIFT+";
+    if (k.cmd)   pre += "CMD+";
+    return pre + s;
 }
 static std::string keysIniString(Action a) {
     std::string out;
@@ -426,6 +488,13 @@ static void writeIni() {
     fprintf(f, "sessioninfolder=%d\n", g_sessionInFolder ? 1 : 0);
     std::string ex; for (auto& e : g_exts) { if (!ex.empty()) ex += ";"; ex += e; }
     fprintf(f, "extensions=%s\n", ex.c_str());
+    fputs("[keywords]\n"
+          "; keyword sets: setNkey = the key that toggles set N while culling,\n"
+          "; setNwords = its comma-separated keywords. Edit in-app with K.\n", f);
+    for (int i = 0; i < kKwSlots; i++) {
+        std::string tok = g_kwSlots[i].bound ? iniTokenForKey(g_kwSlots[i].key) : "";
+        fprintf(f, "set%dkey=%s\nset%dwords=%s\n", i + 1, tok.c_str(), i + 1, g_kwSlots[i].words.c_str());
+    }
     fclose(f);
 }
 // Bind a key to an action: steal it from any other action, add it here, persist.
@@ -436,6 +505,20 @@ static void bindActionToKey(Action a, const KeySpec& k) {
         if (it->second == a || it->first == k) it = g_keymap.erase(it); else ++it;
     g_keymap.push_back({ k, a });
     writeIni();
+}
+// Describe what ELSE currently uses key k — an action or a keyword set — ignoring
+// the action / keyword slot being edited. Returns nil if the key is free.
+static NSString* keyUsedBy(const KeySpec& k, Action ignoreAction, int ignoreKwSlot) {
+    for (auto& kv : g_keymap) {
+        if (!(kv.first == k) || kv.second == ignoreAction) continue;
+        for (auto& r : kActRows) if (r.a == kv.second)
+            return [NSString stringWithFormat:@"“%s”", r.label];
+        return @"an app control";
+    }
+    for (int i = 0; i < kKwSlots; i++)
+        if (i != ignoreKwSlot && g_kwSlots[i].bound && g_kwSlots[i].key == k)
+            return [NSString stringWithFormat:@"keyword set %d", i + 1];
+    return nil;
 }
 
 // ---------------------------------------------------------------- decode
@@ -877,7 +960,7 @@ static std::string readFileUTF8(const std::string& p) {
     fclose(f);
     return s;
 }
-// Read a sidecar (if any) and reflect its rating/label into the item, async.
+// Read a sidecar (if any) and reflect its rating/label/keywords into the item.
 static void loadSidecar(int idx) {
     if (idx < 0 || idx >= (int)g_items.size()) return;
     std::string path = g_items[idx].path;
@@ -885,13 +968,15 @@ static void loadSidecar(int idx) {
         std::string xmp = readFileUTF8(sidecarPath(path));
         int rating = 0, label = 0;
         if (!xmp.empty()) xmpParse(xmp, rating, label);
-        else { rating = 0; label = 0; }
+        std::vector<std::string> kws = xmp.empty() ? std::vector<std::string>{}
+                                                   : xmpGetKeywords(xmp);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (idx < (int)g_items.size() && g_items[idx].path == path &&
                 g_items[idx].rating == -2) {       // don't clobber a fresh user rating
                 g_items[idx].rating = xmp.empty() ? 0 : rating;
                 g_items[idx].label  = xmp.empty() ? -1 : label;
-                [[NSApp keyWindow].contentView setNeedsDisplay:YES];
+                g_items[idx].keywords = kws;
+                [g_contentView setNeedsDisplay:YES];
             }
         });
     });
@@ -902,6 +987,17 @@ static void writeSidecar(const std::string& raw, int rating, int label) {
         std::string sc = sidecarPath(raw);
         std::string existing = readFileUTF8(sc);
         std::string patched = xmpApply(existing, rating, label);
+        FILE* f = fopen(sc.c_str(), "wb");
+        if (f) { fwrite(patched.data(), 1, patched.size(), f); fclose(f); }
+    });
+}
+// Write the image's FULL keyword list (replaces the sidecar's dc:subject bag).
+// Same serial queue as rating/label writes, so ordering is preserved.
+static void writeSidecarKeywords(const std::string& raw, std::vector<std::string> kws) {
+    dispatch_async(g_sidecarQ, ^{
+        std::string sc = sidecarPath(raw);
+        std::string existing = readFileUTF8(sc);
+        std::string patched = xmpApplyKeywords(existing, kws);
         FILE* f = fopen(sc.c_str(), "wb");
         if (f) { fwrite(patched.data(), 1, patched.size(), f); fclose(f); }
     });
@@ -1018,6 +1114,10 @@ static std::vector<FiltChip> g_filterChips;
 // 5 infopos 6 session 7 clearcache 8 filetype 9 pairjpg
 struct PChip { CGRect rc; int kind; int val; };
 static std::vector<PChip> g_pchips;
+
+// Keyword-sets editor hit rects. kind: 0 key chip 1 words field 2 close 3 clear key
+struct KwChip { CGRect rc; int kind; int val; };
+static std::vector<KwChip> g_kwChips;
 static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
                                   ".raf",".rw2",".pef",".dng",".orf",".jpg" };
 
@@ -1071,6 +1171,7 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     // modal panels (can be open in loupe or grid) take clicks first
     if (g_prefsOpen)  { [self prefsClickAt:pt];  return; }
     if (g_filterOpen) { [self filterClickAt:pt]; return; }
+    if (g_kwOpen)     { [self kwClickAt:pt];     return; }
     if (!g_gridMode) return;
 
     // scrollbar grab (right edge, content area) — click-to-jump then drag
@@ -1139,7 +1240,8 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     if (g_gridMode) { [self drawGrid:ctx bounds:b];
         if (g_helpOpen) [self drawHelpOverlay:ctx bounds:b];
         if (g_prefsOpen) [self drawPrefs:ctx bounds:b];
-        if (g_filterOpen) [self drawFilter:ctx bounds:b]; return; }
+        if (g_filterOpen) [self drawFilter:ctx bounds:b];
+        if (g_kwOpen) [self drawKeywords:ctx bounds:b]; return; }
 
     if (_image) {
         if (g_zoom && g_zoomImage) {
@@ -1224,6 +1326,7 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     if (g_helpOpen) [self drawHelpOverlay:ctx bounds:b];
     if (g_prefsOpen) [self drawPrefs:ctx bounds:b];
     if (g_filterOpen) [self drawFilter:ctx bounds:b];
+    if (g_kwOpen) [self drawKeywords:ctx bounds:b];
 }
 
 // Shortcut help (Windows layout): title, a two-column grid of gold keys + gray
@@ -1346,10 +1449,14 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     chip(cc, 220, NO, 7, 0);
     cy -= optH;
 
-    // key rebind header
+    // key rebind header (or a conflict notice after a reassignment)
     NSString* kh = g_prefsCaptureAction >= 0 ? @"Press the new key…  (Esc cancels)"
-                                             : @"Keys — click an action, then press its new key:";
-    [kh drawAtPoint:NSMakePoint(px + pad, cy - 18) withAttributes:labA];
+                 : g_prefsMsg ? g_prefsMsg
+                              : @"Keys — click an action, then press its new key:";
+    [kh drawAtPoint:NSMakePoint(px + pad, cy - 18) withAttributes:@{
+        NSFontAttributeName: [NSFont systemFontOfSize:13],
+        NSForegroundColorAttributeName: g_prefsMsg && g_prefsCaptureAction < 0
+            ? kStarGold() : [NSColor colorWithWhite:0.72 alpha:1] }];
     cy -= rowH;
 
     // two-column rebind grid
@@ -1393,13 +1500,102 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
                 if (it != g_exts.end()) g_exts.erase(it); else g_exts.push_back(e);
                 break; }
             case 9: g_pairRawJpg = !g_pairRawJpg; break;
-            case 2: g_prefsCaptureAction = c.val; [self setNeedsDisplay:YES]; return YES;  // no ini write
+            case 2: g_prefsCaptureAction = c.val; g_prefsMsg = nil; [self setNeedsDisplay:YES]; return YES;  // no ini write
             case 3: g_prefsOpen = false; [self setNeedsDisplay:YES]; return YES;
         }
         writeIni();
         [self setNeedsDisplay:YES];
         return YES;
     }
+    return NO;
+}
+
+// Keyword-sets editor (K). One dedicated screen: 10 slots, each = a key chip
+// (click, then press the key that will toggle this set while culling), a ✕ to
+// unbind, and a keywords field (click, type; comma-separated). Saved to the
+// APP-LEVEL ini ([keywords] section) on every change — deliberately NOT
+// per-folder, so your sets follow you across shoots.
+- (void)drawKeywords:(CGContextRef)ctx bounds:(NSRect)b {
+    g_kwChips.clear();
+    CGFloat panelW = 760, rowH = 36, chipH = 28, pad = 20;
+    CGFloat panelH = kKwSlots * rowH + rowH * 4 + pad * 2;
+    CGFloat px = (b.size.width - panelW) / 2;
+    CGFloat py = std::max((CGFloat)16, (b.size.height - panelH) / 2);
+    [[NSColor colorWithSRGBRed:0.094 green:0.094 blue:0.102 alpha:0.98] setFill];
+    NSRectFill(NSMakeRect(px, py, panelW, panelH));
+    [[NSColor colorWithWhite:0.43 alpha:1] setStroke];
+    NSBezierPath* fr = [NSBezierPath bezierPathWithRect:NSMakeRect(px, py, panelW, panelH)];
+    fr.lineWidth = 1; [fr stroke];
+
+    NSFont* f13 = [NSFont systemFontOfSize:13];
+    NSDictionary* labA = @{ NSFontAttributeName: f13,
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.72 alpha:1] };
+
+    // title (centred)
+    NSString* title = @"Keyword sets — press a set's key while culling to toggle its keywords";
+    NSDictionary* tA = @{ NSFontAttributeName: [NSFont systemFontOfSize:15],
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.92 alpha:1] };
+    NSSize tsz = [title sizeWithAttributes:tA];
+    CGFloat top = py + panelH - 14;
+    [title drawAtPoint:NSMakePoint(px + (panelW - tsz.width) / 2, top - tsz.height) withAttributes:tA];
+
+    CGFloat y = top - rowH * 1.6;
+    for (int i = 0; i < kKwSlots; i++) {
+        CGFloat ry = y - chipH;
+        // slot number
+        [[NSString stringWithFormat:@"Set %d", i + 1]
+            drawAtPoint:NSMakePoint(px + pad, ry + (chipH - 16) / 2) withAttributes:labA];
+        // key chip
+        NSString* kt;
+        if (g_kwCaptureSlot == i) kt = @"press key…";
+        else if (g_kwSlots[i].bound) kt = [NSString stringWithUTF8String:keyDisplayName(g_kwSlots[i].key).c_str()];
+        else kt = @"(no key)";
+        CGRect keyR = CGRectMake(px + pad + 58, ry, 110, chipH);
+        [self drawChip:keyR text:kt on:(g_kwCaptureSlot == i) dot:nil];
+        g_kwChips.push_back({ keyR, 0, i });
+        // clear-key ✕
+        CGRect clrR = CGRectMake(keyR.origin.x + 116, ry, 30, chipH);
+        [self drawChip:clrR text:@"✕" on:NO dot:nil];
+        g_kwChips.push_back({ clrR, 3, i });
+        // words field
+        CGRect tf = CGRectMake(clrR.origin.x + 38, ry, px + panelW - pad - (clrR.origin.x + 38), chipH);
+        [[NSColor colorWithWhite:(g_kwEditSlot == i ? 0.20 : 0.16) alpha:1] setFill]; NSRectFill(tf);
+        [(g_kwEditSlot == i ? [NSColor colorWithSRGBRed:0.27 green:0.43 blue:0.70 alpha:1]
+                            : [NSColor colorWithWhite:0.45 alpha:1]) setStroke];
+        NSBezierPath* tb = [NSBezierPath bezierPathWithRect:tf]; tb.lineWidth = 1; [tb stroke];
+        NSString* wt;
+        if (!g_kwSlots[i].words.empty())
+            wt = [[NSString stringWithUTF8String:g_kwSlots[i].words.c_str()] ?: @""
+                  stringByAppendingString:(g_kwEditSlot == i ? @"▏" : @"")];
+        else wt = (g_kwEditSlot == i) ? @"▏" : @"(keywords, comma separated)";
+        NSDictionary* wa = @{ NSFontAttributeName: f13, NSForegroundColorAttributeName:
+            g_kwSlots[i].words.empty() && g_kwEditSlot != i ? [NSColor colorWithWhite:0.5 alpha:1] : [NSColor whiteColor] };
+        [wt drawAtPoint:NSMakePoint(tf.origin.x + 8, ry + (chipH - 16) / 2) withAttributes:wa];
+        g_kwChips.push_back({ tf, 1, i });
+        y -= rowH;
+    }
+
+    // footer: message / hint + Close
+    NSString* hint = g_kwMsg ?: @"Click a key chip then press a key · click a field to type · saved in app settings";
+    [hint drawAtPoint:NSMakePoint(px + pad, py + pad * 0.5)
+        withAttributes:@{ NSFontAttributeName: [NSFont systemFontOfSize:12],
+            NSForegroundColorAttributeName: g_kwMsg ? kStarGold() : [NSColor colorWithWhite:0.6 alpha:1] }];
+    CGRect closeR = CGRectMake(px + panelW - pad - 96, py + pad * 0.4, 96, chipH);
+    [self drawChip:closeR text:@"Close (Esc)" on:NO dot:nil];
+    g_kwChips.push_back({ closeR, 2, 0 });
+}
+// Click routing for the keyword editor. Returns YES if it hit anything.
+- (BOOL)kwClickAt:(NSPoint)pt {
+    for (auto& c : g_kwChips) {
+        if (!CGRectContainsPoint(c.rc, pt)) continue;
+        if (c.kind == 0)      { g_kwCaptureSlot = c.val; g_kwEditSlot = -1; g_kwMsg = nil; }
+        else if (c.kind == 1) { g_kwEditSlot = c.val; g_kwCaptureSlot = -1; g_kwMsg = nil; }
+        else if (c.kind == 3) { g_kwSlots[c.val].bound = false; writeIni(); }
+        else if (c.kind == 2) { g_kwOpen = false; g_kwEditSlot = g_kwCaptureSlot = -1; writeIni(); }
+        [self setNeedsDisplay:YES];
+        return YES;
+    }
+    if (g_kwEditSlot >= 0) { g_kwEditSlot = -1; writeIni(); [self setNeedsDisplay:YES]; }
     return NO;
 }
 
@@ -1814,9 +2010,12 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
             int rating = 0, label = 0;
             if (!xmp.empty()) xmpParse(xmp, rating, label);
             int fr = xmp.empty() ? 0 : rating, fl = xmp.empty() ? -1 : label;
+            std::vector<std::string> kws = xmp.empty() ? std::vector<std::string>{}
+                                                       : xmpGetKeywords(xmp);
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (i < (int)g_items.size() && g_items[i].rating == -2) {
                     g_items[i].rating = fr; g_items[i].label = fl;
+                    g_items[i].keywords = kws;
                     if (g_gridMode) [g_contentView setNeedsDisplay:YES];   // badges live
                 }
             });
@@ -1990,7 +2189,7 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
 
 // ---- preferences / rebind ----
 - (void)openPrefs {
-    g_prefsOpen = true; g_prefsCaptureAction = -1;
+    g_prefsOpen = true; g_prefsCaptureAction = -1; g_prefsMsg = nil;
     g_helpOpen = false; g_filterOpen = false;
     [self.view setNeedsDisplay:YES];
 }
@@ -2001,13 +2200,96 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     if (g_prefsCaptureAction >= 0) {
         if (kc != 53) {                                   // Esc cancels; else bind it
             KeySpec k = specForEvent(e);
-            if (k.keyCode >= 0 || k.ch) bindActionToKey((Action)g_prefsCaptureAction, k);
+            if (k.keyCode >= 0 || k.ch) {
+                Action a = (Action)g_prefsCaptureAction;
+                NSString* prior = keyUsedBy(k, a, -1);    // what did this key do before?
+                // A keyword set on this key would go silently dead (actions win in
+                // dispatch), so unbind it and say so.
+                for (int i = 0; i < kKwSlots; i++)
+                    if (g_kwSlots[i].bound && g_kwSlots[i].key == k) g_kwSlots[i].bound = false;
+                bindActionToKey(a, k);                    // also steals from another action
+                g_prefsMsg = prior ? [NSString stringWithFormat:@"Reassigned that key from %@.", prior] : nil;
+            }
         }
         g_prefsCaptureAction = -1;
         [self.view setNeedsDisplay:YES];
         return;
     }
     if (kc == 53 || actionForEvent(e) == A_PREFS) g_prefsOpen = false;   // close
+    [self.view setNeedsDisplay:YES];
+}
+
+// ---- keyword sets ----
+- (void)openKeywords {
+    g_kwOpen = true; g_kwCaptureSlot = -1; g_kwEditSlot = -1; g_kwMsg = nil;
+    g_helpOpen = false; g_prefsOpen = false; g_filterOpen = false;
+    [self.view setNeedsDisplay:YES];
+}
+// Keyboard while the keyword editor is open: key-capture for a slot, or typing
+// into a slot's words field, or Esc/K to close.
+- (void)handleKeywordsKey:(NSEvent*)e {
+    unsigned short kc = e.keyCode;
+    if (g_kwCaptureSlot >= 0) {                          // capture the toggle key
+        if (kc != 53) {                                  // Esc cancels
+            KeySpec k = specForEvent(e);
+            if (k.keyCode >= 0 || k.ch) {
+                if (actionForEvent(e) != A_NONE) {         // app controls win — refuse
+                    g_kwMsg = @"That key runs an app control — pick another (or rebind that control in Preferences first).";
+                } else {
+                    int stole = -1;
+                    for (int i = 0; i < kKwSlots; i++)   // steal from another slot (with notice)
+                        if (i != g_kwCaptureSlot && g_kwSlots[i].bound && g_kwSlots[i].key == k)
+                            { g_kwSlots[i].bound = false; stole = i; }
+                    g_kwSlots[g_kwCaptureSlot].key = k;
+                    g_kwSlots[g_kwCaptureSlot].bound = true;
+                    g_kwMsg = stole >= 0
+                        ? [NSString stringWithFormat:@"Moved that key here from Set %d.", stole + 1] : nil;
+                    writeIni();
+                }
+            }
+        }
+        g_kwCaptureSlot = -1;
+        [self.view setNeedsDisplay:YES];
+        return;
+    }
+    if (g_kwEditSlot >= 0) {                             // typing keywords
+        if (kc == 53 || kc == 36) { g_kwEditSlot = -1; writeIni(); }   // Esc/Enter done
+        else if (kc == 51) { auto& w = g_kwSlots[g_kwEditSlot].words;  // Backspace
+                             if (!w.empty()) w.pop_back(); }
+        else {
+            NSString* ch = e.characters;
+            if (ch.length == 1) { unichar c = [ch characterAtIndex:0];
+                if (c >= 32 && c < 127) g_kwSlots[g_kwEditSlot].words.push_back((char)c); }
+        }
+        [self.view setNeedsDisplay:YES];
+        return;
+    }
+    if (kc == 53 || actionForEvent(e) == A_KEYWORDS) { g_kwOpen = false; writeIni(); }
+    [self.view setNeedsDisplay:YES];
+}
+// Toggle a slot's keywords on the current image: if the image already has ALL of
+// them they're removed, otherwise the missing ones are added. Full list written
+// to the sidecar (async, same serial queue as rating writes).
+- (void)toggleKeywordSlot:(int)slot {
+    int idx = curItem(); if (idx < 0) return;
+    auto kws = splitKeywords(g_kwSlots[slot].words);
+    if (kws.empty()) return;
+    Item& it = g_items[idx];
+    bool hasAll = true;
+    for (auto& k : kws)
+        if (std::find(it.keywords.begin(), it.keywords.end(), k) == it.keywords.end())
+            { hasAll = false; break; }
+    if (hasAll) {
+        for (auto& k : kws)
+            it.keywords.erase(std::remove(it.keywords.begin(), it.keywords.end(), k),
+                              it.keywords.end());
+    } else {
+        for (auto& k : kws)
+            if (std::find(it.keywords.begin(), it.keywords.end(), k) == it.keywords.end())
+                it.keywords.push_back(k);
+    }
+    writeSidecarKeywords(it.path, it.keywords);
+    if (!g_gridMode) self.view.infoText = [self infoStringForView:g_cur exif:g_curExif decoded:YES];
     [self.view setNeedsDisplay:YES];
 }
 
@@ -2116,6 +2398,15 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
         if (!e.lens.empty())     [extra addObject:[NSString stringWithUTF8String:e.lens.c_str()]];
         if (extra.count) [m appendFormat:@"   |   %@", [extra componentsJoinedByString:@"   "]];
     } else [m appendString:@"   (no preview)"];
+    // keywords (first few, comma-joined, braced so they read as tags)
+    if (!it.keywords.empty()) {
+        std::string kj;
+        for (size_t i = 0; i < it.keywords.size() && i < 4; i++)
+            { if (!kj.empty()) kj += ", "; kj += it.keywords[i]; }
+        if (it.keywords.size() > 4) kj += ", …";
+        NSString* ks = [NSString stringWithUTF8String:kj.c_str()];
+        if (ks) [m appendFormat:@"   {%@}", ks];
+    }
     return m;
 }
 
@@ -2177,6 +2468,7 @@ int main(int argc, const char* argv[]) {
             // Modal overlays grab all keys while open.
             if (g_prefsOpen)  { [del handlePrefsKey:e];  return nil; }
             if (g_filterOpen) { [del handleFilterKey:e]; return nil; }
+            if (g_kwOpen)     { [del handleKeywordsKey:e]; return nil; }
 
             // While help is open, any key just closes it (and is swallowed).
             if (g_helpOpen) { g_helpOpen = false; [del.view setNeedsDisplay:YES];
@@ -2204,7 +2496,17 @@ int main(int argc, const char* argv[]) {
                 return nil;
             }
 
-            if (a == A_NONE) return e;
+            if (a == A_NONE) {
+                // keyword-set keys fire only when no app action claims the key
+                KeySpec want = specForEvent(e);
+                for (int i = 0; i < kKwSlots; i++)
+                    if (g_kwSlots[i].bound && g_kwSlots[i].key == want &&
+                        !g_kwSlots[i].words.empty()) {
+                        [del toggleKeywordSlot:i];
+                        return nil;
+                    }
+                return e;
+            }
             bool isNav = (a == A_NEXT || a == A_PREV || a == A_FIRST || a == A_LAST);
             if (!g_gridMode && isNav && e.isARepeat && g_decoding.load()) return nil;  // swallow
 
@@ -2220,6 +2522,7 @@ int main(int argc, const char* argv[]) {
                 case A_GRID:  [del toggleGrid]; break;
                 case A_ZOOM:  [del toggleZoom]; break;
                 case A_FILTER: [del openFilter]; break;
+                case A_KEYWORDS: [del openKeywords]; break;
                 case A_RATE0: [del applyRating:0]; break;
                 case A_RATE1: [del applyRating:1]; break;
                 case A_RATE2: [del applyRating:2]; break;
