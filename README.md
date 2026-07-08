@@ -8,7 +8,7 @@
 Free donationware · source on GitHub · native · tiny · your raws are never touched.
 
 <a href="https://github.com/shootthesound/iRate/releases/download/macos-v1.0.1/iRate-macos-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
-<a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.0.1/iRate-windows-1.0.1.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
+<a href="https://github.com/shootthesound/iRate/releases/download/windows-v1.1/iRate-windows-1.1.zip"><img src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logoColor=white" alt="Download for Windows"></a>
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 
 *macOS 11+ (Apple Silicon / M-series) · Windows 10/11 x64 · [all releases](https://github.com/shootthesound/iRate/releases)*
@@ -61,7 +61,7 @@ On top of that:
   and the contact sheet is simply *there*.
 - **Native code, one tiny binary, zero dependencies.** AppKit + ImageIO on the Mac,
   Win32 + WIC on Windows. No Electron, no runtime, nothing to install. The Windows
-  build is a single 700KB exe.
+  build is a single ~750KB exe.
 
 ## Built for the cull
 
@@ -147,7 +147,7 @@ Settings live in `~/Library/Application Support/iRate/`. Build from source:
 
 ### Windows
 
-1. **[Download](https://github.com/shootthesound/iRate/releases/download/windows-v1.0.1/iRate-windows-1.0.1.zip)**, unzip anywhere — it's a single portable exe.
+1. **[Download](https://github.com/shootthesound/iRate/releases/download/windows-v1.1/iRate-windows-1.1.zip)**, unzip anywhere — it's a single portable exe.
 2. First launch only: if SmartScreen objects, **More info → Run anyway** (unsigned build).
 3. Double-click and pick a folder — or drag a folder onto the exe, or
    `iRate.exe "E:\Shoot"`.
