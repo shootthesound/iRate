@@ -277,14 +277,20 @@ static KeySpec parseKeyToken(std::string s) {
     if (s.size() == 1) { k.ch = (unichar)tolower((unsigned char)s[0]); }
     return k;
 }
-// Bind a comma-separated key list to an action.
-static void bindKeys(const std::string& list, Action a) {
+// Bind a comma-separated key list to an action. onlyIfFree = for DEFAULT bindings
+// of an action the ini didn't mention (an upgrade adding a new action, e.g. K for
+// keyword sets): don't steal a key the user already assigned to something else.
+static void bindKeys(const std::string& list, Action a, bool onlyIfFree = false) {
     size_t start = 0;
     while (start <= list.size()) {
         size_t comma = list.find(',', start);
         std::string one = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
         KeySpec k = parseKeyToken(one);
-        if (k.keyCode >= 0 || k.ch != 0) g_keymap.push_back({ k, a });
+        if (k.keyCode >= 0 || k.ch != 0) {
+            bool taken = false;
+            if (onlyIfFree) for (auto& kv : g_keymap) if (kv.first == k) { taken = true; break; }
+            if (!taken) g_keymap.push_back({ k, a });
+        }
         if (comma == std::string::npos) break;
         start = comma + 1;
     }
@@ -346,9 +352,9 @@ static void iniLoadFile(const std::string& path) {
     g_ini.clear();
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return;
-    char line[1024]; std::string sec;
-    while (fgets(line, sizeof line, f)) {
-        std::string s(line);
+    char* buf = nullptr; size_t cap = 0; ssize_t len; std::string sec;   // getline: no line-length cap
+    while ((len = getline(&buf, &cap, f)) != -1) {                        // (long keyword lists must not truncate)
+        std::string s(buf, (size_t)len);
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
         size_t a = s.find_first_not_of(" \t"); if (a == std::string::npos) continue;
         if (s[a] == ';' || s[a] == '#') continue;
@@ -364,12 +370,17 @@ static void iniLoadFile(const std::string& path) {
         for (auto& c : sec) c = (char)tolower((unsigned char)c);
         g_ini[sec][key] = val;
     }
+    free(buf);
     fclose(f);
 }
 static std::string iniGet(const char* sec, const char* key, const char* def) {
     auto s = g_ini.find(sec); if (s == g_ini.end()) return def;
     auto k = s->second.find(key); if (k == s->second.end()) return def;
     return k->second;
+}
+static bool iniHas(const char* sec, const char* key) {
+    auto s = g_ini.find(sec); if (s == g_ini.end()) return false;
+    return s->second.find(key) != s->second.end();
 }
 
 // The default ini written on first run so the owner has something to edit.
@@ -403,8 +414,10 @@ static void loadConfig(const std::string& supportDir) {
     }
     iniLoadFile(g_iniPath);
     g_keymap.clear();
-    for (auto& r : kActRows)
-        bindKeys(iniGet("keys", r.iniName, r.defKey), r.a);
+    for (auto& r : kActRows) {
+        if (iniHas("keys", r.iniName)) bindKeys(iniGet("keys", r.iniName, ""), r.a);
+        else bindKeys(r.defKey, r.a, /*onlyIfFree=*/true);   // new action on an old ini: don't steal
+    }
     g_showInfo = iniGet("options", "showinfo", "1") != "0";
     g_pairRawJpg = iniGet("options", "pairrawjpg", "1") != "0";
     g_sessionInFolder = iniGet("options", "sessioninfolder", "1") != "0";
@@ -951,21 +964,39 @@ static std::string sidecarPath(const std::string& raw) {
     size_t dot = raw.find_last_of('.');
     return (dot == std::string::npos ? raw : raw.substr(0, dot)) + ".xmp";
 }
-static std::string readFileUTF8(const std::string& p) {
-    FILE* f = fopen(p.c_str(), "rb");
-    if (!f) return "";
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    std::string s(n > 0 ? n : 0, 0);
-    if (n > 0) { size_t rd = fread(&s[0], 1, n, f); s.resize(rd); }
-    fclose(f);
-    return s;
+// Read a sidecar for patching, distinguishing "missing" from "unreadable" to
+// avoid the DATA-LOSS clobber: a transient read failure on an EXISTING sidecar
+// (Lightroom/AV/Dropbox briefly holding it, short read) would otherwise hand ""
+// to xmpApply/xmpApplyKeywords, which build a fresh minimal doc that replaces the
+// user's real crs:*/rating/label/keywords. Returns:
+//   file missing        -> out="", true   (a fresh sidecar is correct)
+//   read OK             -> out=data, true
+//   exists but unreadable after retries -> false  (caller MUST NOT write)
+static bool readSidecarForPatch(const std::string& p, std::string& out) {
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) { out.clear(); return true; }   // missing -> fresh OK
+    for (int attempt = 0; attempt < 3; attempt++) {
+        FILE* f = fopen(p.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            if (n >= 0) {
+                std::string s((size_t)(n > 0 ? n : 0), 0);
+                size_t rd = n > 0 ? fread(&s[0], 1, (size_t)n, f) : 0;
+                fclose(f);
+                if (rd == (size_t)n) { out.swap(s); return true; }   // 0-byte counts as readable
+            } else fclose(f);
+        }
+        usleep(50000);   // 50ms, then retry
+    }
+    return false;   // exists but unreadable -> drop the op, never clobber
 }
 // Read a sidecar (if any) and reflect its rating/label/keywords into the item.
 static void loadSidecar(int idx) {
     if (idx < 0 || idx >= (int)g_items.size()) return;
     std::string path = g_items[idx].path;
     dispatch_async(g_sidecarQ, ^{
-        std::string xmp = readFileUTF8(sidecarPath(path));
+        std::string xmp;
+        if (!readSidecarForPatch(sidecarPath(path), xmp)) return;   // unreadable: retry on next visit (stays -2)
         int rating = 0, label = 0;
         if (!xmp.empty()) xmpParse(xmp, rating, label);
         std::vector<std::string> kws = xmp.empty() ? std::vector<std::string>{}
@@ -984,8 +1015,8 @@ static void loadSidecar(int idx) {
 // Patch (or create) the sidecar for one item. kXmpKeep leaves a field alone.
 static void writeSidecar(const std::string& raw, int rating, int label) {
     dispatch_async(g_sidecarQ, ^{
-        std::string sc = sidecarPath(raw);
-        std::string existing = readFileUTF8(sc);
+        std::string sc = sidecarPath(raw), existing;
+        if (!readSidecarForPatch(sc, existing)) return;   // unreadable -> don't clobber
         std::string patched = xmpApply(existing, rating, label);
         FILE* f = fopen(sc.c_str(), "wb");
         if (f) { fwrite(patched.data(), 1, patched.size(), f); fclose(f); }
@@ -995,8 +1026,8 @@ static void writeSidecar(const std::string& raw, int rating, int label) {
 // Same serial queue as rating/label writes, so ordering is preserved.
 static void writeSidecarKeywords(const std::string& raw, std::vector<std::string> kws) {
     dispatch_async(g_sidecarQ, ^{
-        std::string sc = sidecarPath(raw);
-        std::string existing = readFileUTF8(sc);
+        std::string sc = sidecarPath(raw), existing;
+        if (!readSidecarForPatch(sc, existing)) return;   // unreadable -> don't clobber
         std::string patched = xmpApplyKeywords(existing, kws);
         FILE* f = fopen(sc.c_str(), "wb");
         if (f) { fwrite(patched.data(), 1, patched.size(), f); fclose(f); }
@@ -1335,7 +1366,7 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     int nRows = kNumActRows, perCol = (nRows + 1) / 2;
     CGFloat colW = 340, rowH = 26, pad = 24;
     CGFloat panelW = colW * 2 + pad * 2;
-    CGFloat panelH = perCol * rowH + pad * 2 + rowH * 4;   // + title + footer
+    CGFloat panelH = perCol * rowH + pad * 2 + rowH * 5;   // + title + footer + donation line
     CGFloat px = (b.size.width - panelW) / 2, py = (b.size.height - panelH) / 2;
     [[NSColor colorWithSRGBRed:0.094 green:0.094 blue:0.102 alpha:0.98] setFill];
     NSRectFill(NSMakeRect(px, py, panelW, panelH));
@@ -1368,12 +1399,18 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
         [[NSString stringWithUTF8String:kActRows[i].label]
             drawAtPoint:NSMakePoint(x + 116, y) withAttributes:labA];
     }
+    NSMutableParagraphStyle* ps = [NSMutableParagraphStyle new]; ps.alignment = NSTextAlignmentCenter;
     NSString* foot = @"Reject (✖) = xmp:Rating \"-1\" — Bridge / Photo Mechanic only; "
                       "Lightroom ignores XMP rejects (its flags are catalog-only)";
-    NSMutableParagraphStyle* ps = [NSMutableParagraphStyle new]; ps.alignment = NSTextAlignmentCenter;
-    [foot drawInRect:NSMakeRect(px + pad, py + pad * 0.6, panelW - pad * 2, rowH * 2)
+    [foot drawInRect:NSMakeRect(px + pad, py + pad * 0.5 + rowH * 1.3, panelW - pad * 2, rowH * 2)
         withAttributes:@{ NSFontAttributeName: [NSFont systemFontOfSize:12],
             NSForegroundColorAttributeName: [NSColor colorWithWhite:0.6 alpha:1],
+            NSParagraphStyleAttributeName: ps }];
+    // donationware ask (gold), mirrors the Windows help footer
+    NSString* dona = @"iRate is donationware — if it saves your evenings: buymeacoffee.com/lorasandlenses";
+    [dona drawInRect:NSMakeRect(px + pad, py + pad * 0.4, panelW - pad * 2, rowH)
+        withAttributes:@{ NSFontAttributeName: [NSFont systemFontOfSize:12.5],
+            NSForegroundColorAttributeName: kStarGold(),
             NSParagraphStyleAttributeName: ps }];
 }
 
@@ -2005,8 +2042,8 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     dispatch_async(g_sidecarQ, ^{
         int n = (int)g_items.size();
         for (int i = 0; i < n; i++) {
-            std::string sc = sidecarPath(g_items[i].path);
-            std::string xmp = readFileUTF8(sc);
+            std::string sc = sidecarPath(g_items[i].path), xmp;
+            if (!readSidecarForPatch(sc, xmp)) continue;   // unreadable: leave -2, retry on visit
             int rating = 0, label = 0;
             if (!xmp.empty()) xmpParse(xmp, rating, label);
             int fr = xmp.empty() ? 0 : rating, fl = xmp.empty() ? -1 : label;
@@ -2232,7 +2269,15 @@ static const char* kAllExts[] = { ".arw",".cr2",".cr3",".nef",".nrw",
     if (g_kwCaptureSlot >= 0) {                          // capture the toggle key
         if (kc != 53) {                                  // Esc cancels
             KeySpec k = specForEvent(e);
-            if (k.keyCode >= 0 || k.ch) {
+            // Grid mode consumes these keyCodes before slot dispatch (regardless of
+            // modifiers), so a set bound to one would silently never fire in grid.
+            bool gridKey = (kc == 123 || kc == 124 || kc == 125 || kc == 126 ||
+                            kc == 36 || kc == 116 || kc == 121);
+            if (k.cmd && k.ch == 'q') {                  // never let capture eat Cmd+Q
+                g_kwMsg = @"⌘Q quits — pick another key.";
+            } else if (gridKey) {
+                g_kwMsg = @"That key navigates the grid — pick another.";
+            } else if (k.keyCode >= 0 || k.ch) {
                 if (actionForEvent(e) != A_NONE) {         // app controls win — refuse
                     g_kwMsg = @"That key runs an app control — pick another (or rebind that control in Preferences first).";
                 } else {
@@ -2465,6 +2510,13 @@ int main(int argc, const char* argv[]) {
             Action a = actionForEvent(e);
             unsigned short kc = e.keyCode;
 
+            // ⌘Q always quits (the borderless app has no menu to do it) — handled
+            // before modals/capture so a rebind can never swallow or bind it.
+            if ((e.modifierFlags & NSEventModifierFlagCommand) &&
+                [[e.charactersIgnoringModifiers lowercaseString] isEqualToString:@"q"]) {
+                [NSApp terminate:nil]; return nil;
+            }
+
             // Modal overlays grab all keys while open.
             if (g_prefsOpen)  { [del handlePrefsKey:e];  return nil; }
             if (g_filterOpen) { [del handleFilterKey:e]; return nil; }
@@ -2502,7 +2554,9 @@ int main(int argc, const char* argv[]) {
                 for (int i = 0; i < kKwSlots; i++)
                     if (g_kwSlots[i].bound && g_kwSlots[i].key == want &&
                         !g_kwSlots[i].words.empty()) {
-                        [del toggleKeywordSlot:i];
+                        // ignore auto-repeat — a toggle isn't idempotent, so a held
+                        // key would flip the keywords on/off per typematic repeat
+                        if (!e.isARepeat) [del toggleKeywordSlot:i];
                         return nil;
                     }
                 return e;
