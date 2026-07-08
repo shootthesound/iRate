@@ -70,3 +70,33 @@ The feature shipped Mac-first, so several are likely present in `mac/main.mm` �
 The review also confirmed the WM_SYSKEYDOWN fall-through design (Alt combos
 reach the shared handler only for keys the app owns) and refuted two suspected
 races (bulk sidecar loader vs sidecar thread — serialized by the items mutex).
+
+## Mac audit results (2026-07, `mac/main.mm`)
+
+All six cross-platform items were present on Mac and are now **fixed**:
+
+1. **Sidecar clobber — WAS PRESENT, FIXED.** `writeSidecar` / `writeSidecarKeywords`
+   used a reader that couldn't tell missing from unreadable. New
+   `readSidecarForPatch()` returns false when the file exists but is unreadable
+   after 3×50ms retries; both write paths now drop the op instead of writing a
+   fresh doc. Also applied to `loadSidecar` / `loadAllSidecars` so a transient
+   read failure can't cache a false-empty keyword list that a later toggle would
+   persist (leaves the item unloaded → retried on next visit).
+2. **Toggle on auto-repeat — WAS PRESENT, FIXED.** The keyword-slot dispatch in the
+   key monitor now consumes but does not toggle when `NSEvent.isARepeat`.
+3. **Grid-reserved keys — WAS PRESENT, FIXED.** The Mac grid consumes keyCodes
+   123/124/125/126 (arrows), 36 (Enter), 116/121 (PgUp/PgDn) before slot dispatch;
+   the keyword editor now refuses those with "That key navigates the grid…".
+4. **New default steals existing key — WAS PRESENT, FIXED.** `bindKeys(..., onlyIfFree)`;
+   `loadConfig` binds an action's DEFAULT key only if the ini lacked that action's
+   entry AND the key is still free (vector keymap would otherwise duplicate it and
+   the earlier binding would win — silent dead default).
+5. **Quit chord capturable — WAS PRESENT, FIXED.** ⌘Q is intercepted at the top of
+   the key monitor (quits) before any modal/capture path, so it can't be bound.
+6. **Fixed-buffer truncation — WAS PRESENT, FIXED.** `iniLoadFile` used a 1024-byte
+   `fgets`; now `getline` (unbounded). Editor field is `std::string`; ini write is
+   `fprintf %s` — both already unbounded.
+
+Windows-specific items 7–9 (numpad twins, numpad serialization, WM_SYSCHAR beep)
+don't apply to macOS (no numpad auto-twin logic; no WM_SYSCHAR). Donationware
+help-overlay line: **done on Mac** (gold, below the reject footnote, same wording).
